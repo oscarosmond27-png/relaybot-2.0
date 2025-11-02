@@ -6,7 +6,7 @@ import { WebSocketServer, WebSocket } from "ws";
 const app = express();
 app.use(express.json());
 
-// 🩺 Health check
+// Health check
 app.get("/", (_req, res) => res.type("text/plain").send("OK"));
 
 // === GroupMe webhook ===
@@ -48,17 +48,26 @@ app.post("/groupme", async (req, res) => {
 // === TwiML for Twilio (voice instructions) ===
 app.get("/twiml", (req, res) => {
   const prompt = req.query.prompt || "";
+  const loopFlag = req.query.loop === "1"; // <-- detect echo test
   const host = req.get("host");
-  const wsUrl = `wss://${host}/twilio?prompt=${encodeURIComponent(prompt)}`;
+
+  // Build WS URL and include loop=1 when requested
+  let wsUrl = `wss://${host}/twilio?prompt=${encodeURIComponent(prompt)}`;
+  if (loopFlag) wsUrl += "&loop=1";
+
+  // Escape for XML attribute (& and " must be encoded)
   const wsAttr = wsUrl.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+
   const xml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
     `<Say>Hello, I have a quick message for you.</Say>` +
     `<Connect><Stream url="${wsAttr}" /></Connect>` +
     `</Response>`;
+
   res.set("Content-Type", "text/xml").send(xml);
 });
+
 
 // === WebSocket audio bridge (Twilio <-> OpenAI) ===
 const server = app.listen(process.env.PORT || 10000, () =>
