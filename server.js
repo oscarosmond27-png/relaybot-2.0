@@ -144,10 +144,17 @@ async function handleTwilio(ws, req) {
         modalities: ["audio"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
+        sample_rate: 8000,
         turn_detection: { type: "server_vad" },
-        instructions: `You are a friendly assistant. Deliver this message: ${prompt}. Keep it short and polite.`,
+        instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`,
       },
     }));
+    oai.send(JSON.stringify({
+      type: "response.create",
+      response: { modalities: ["audio"] }
+    }));
+  });
+
     oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
   });
 
