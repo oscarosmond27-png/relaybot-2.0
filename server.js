@@ -151,13 +151,29 @@ async function handleTwilio(ws, req) {
     oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
   });
 
-  ws.on("message", (data) => {
+ws.on("message", (data) => {
+  try {
     const msg = JSON.parse(data.toString());
-    if (msg.event === "start") streamSid = msg.start.streamSid;
-    else if (msg.event === "media" && streamSid)
-      oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
-    else if (msg.event === "stop") { oai.close(); ws.close(); }
-  });
+    if (msg.event === "start") {
+      streamSid = msg.start.streamSid;
+    } else if (msg.event === "media" && streamSid) {
+      // only send if OpenAI connection is ready
+      if (oai.readyState === WebSocket.OPEN) {
+        oai.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: msg.media.payload
+        }));
+      }
+    } else if (msg.event === "stop") {
+      try { oai.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
+      try { oai.close(); } catch {}
+      try { ws.close(); } catch {}
+    }
+  } catch (err) {
+    console.error("Error handling Twilio message:", err);
+  }
+});
+
 
   oai.on("message", (data) => {
     try {
