@@ -1,0 +1,12 @@
+{
+  "name": "relaybot",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0",
+    "node-fetch": "^3.3.2"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
