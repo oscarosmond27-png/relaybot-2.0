@@ -64,7 +64,7 @@ app.get("/twiml", (req, res) => {
     `<Say>Hello, I have a quick message for you.</Say>` +
     `<Connect><Stream url="${wsAttr}" /></Connect>` +
     `</Response>`;
-
+  console.log("TwiML served for prompt:", prompt, "loop:", loopFlag);
   res.set("Content-Type", "text/xml").send(xml);
 });
 
