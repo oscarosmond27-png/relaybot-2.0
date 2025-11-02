@@ -75,13 +75,48 @@ const server = app.listen(process.env.PORT || 10000, () =>
 );
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
+  console.log("WS upgrade request:", req.url);
   if (req.url.startsWith("/twilio")) {
-    wss.handleUpgrade(req, socket, head, (ws) => handleTwilio(ws, req));
-  } else socket.destroy();
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      console.log("WS upgraded to /twilio");
+      handleTwilio(ws, req).catch(err => {
+        console.error("handleTwilio error:", err);
+        try { ws.close(); } catch {}
+      });
+    });
+  } else {
+    socket.destroy();
+  }
 });
 
+
 async function handleTwilio(ws, req) {
-  const prompt = new URL(req.url, "https://x.com").searchParams.get("prompt") || "";
+  console.log("WS handler entered with URL:", req.url);
+  const url = new URL(req.url, "https://example.com");
+  const prompt = url.searchParams.get("prompt") || "";
+  const loop = url.searchParams.get("loop") === "1";
+
+  // Echo test: bounce caller audio back to caller (no OpenAI)
+  if (loop) {
+    let sid = null;
+    ws.on("message", (buf) => {
+      try {
+        const msg = JSON.parse(buf.toString());
+        if (msg.event === "start") {
+          sid = msg.start?.streamSid;
+        } else if (msg.event === "media" && sid) {
+          ws.send(JSON.stringify({
+            event: "media",
+            streamSid: sid,
+            media: { payload: msg.media.payload }
+          }));
+        } else if (msg.event === "stop") {
+          try { ws.close(); } catch {}
+        }
+      } catch {}
+    });
+    return; // IMPORTANT: don’t connect to OpenAI in loopback
+  }
 
   const oai = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
