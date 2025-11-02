@@ -47,9 +47,20 @@ app.post("/groupme", async (req, res) => {
 
 // === TwiML for Twilio (voice instructions) ===
 app.get("/twiml", (req, res) => {
-  const prompt = req.query.prompt || "";
-  const loopFlag = req.query.loop === "1"; // <-- detect echo test
+  // Handle calls even if Twilio strips the extra parameters
+  let prompt = req.query.prompt || "test";
+  let loopFlag = req.query.loop === "1";
   const host = req.get("host");
+
+  // Log what’s being served (for debugging)
+  console.log("TwiML served for prompt:", prompt, "loop:", loopFlag);
+
+  // If Twilio didn’t include &loop=1, we’ll just turn it on automatically
+  if (!loopFlag) {
+    console.log("No loop flag detected — forcing loop mode for safety.");
+    loopFlag = true;
+  }
+
 
   // Build WS URL and include loop=1 when requested
   let wsUrl = `wss://${host}/twilio?prompt=${encodeURIComponent(prompt)}`;
