@@ -162,19 +162,36 @@ async function handleTwilio(ws, req) {
     oai.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
-          // Convert OpenAI PCM16@16k → PCM16@8k → μ-law → base64
-          const muB64 = pcm16le16kToMulaw8k(msg.delta);
+        const t = msg.type || "(no type)";
+        console.log("OAI msg type:", t);
+    
+        // OpenAI can use either of these event names for audio frames
+        const isDelta =
+          (t === "response.audio.delta" || t === "response.output_audio.delta");
+    
+        if (isDelta && msg.delta && streamSid) {
+          // If you're on the PCM16->8k->mulaw path:
+          // const muB64 = pcm16le16kToMulaw8k(msg.delta);
+    
+          // If you're on the direct μ-law path:
+          const muB64 = msg.delta;
+    
           ws.send(JSON.stringify({
             event: "media",
             streamSid,
             media: { payload: muB64 }
           }));
+          return;
+        }
+    
+        if (t === "error") {
+          console.error("OpenAI error:", msg);
         }
       } catch (err) {
         console.error("Error relaying OpenAI audio:", err);
       }
     });
+
 
 
     oai.on("close", () => { try { ws.close(); } catch {} });
