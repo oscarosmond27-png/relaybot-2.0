@@ -132,11 +132,19 @@ async function handleTwilio(ws, req) {
   const oai = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
     "realtime",
-    { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1"
+      }
+    }
   );
 
   let streamSid = null;
+  let oaiReady = false;
+
   oai.on("open", () => {
+    oaiReady = true;
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -147,7 +155,7 @@ async function handleTwilio(ws, req) {
         sample_rate: 8000,
         turn_detection: { type: "server_vad" },
         instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`,
-      },
+      }
     }));
     oai.send(JSON.stringify({
       type: "response.create",
@@ -155,33 +163,30 @@ async function handleTwilio(ws, req) {
     }));
   });
 
-    oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
+  // Twilio -> OpenAI (guard until OPEN)
+  ws.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.event === "start") {
+        streamSid = msg.start.streamSid;
+      } else if (msg.event === "media" && streamSid) {
+        if (oaiReady && oai.readyState === WebSocket.OPEN) {
+          oai.send(JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: msg.media.payload
+          }));
+        }
+      } else if (msg.event === "stop") {
+        try { oai.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
+        try { oai.close(); } catch {}
+        try { ws.close(); } catch {}
+      }
+    } catch (err) {
+      console.error("Error handling Twilio message:", err);
+    }
   });
 
-ws.on("message", (data) => {
-  try {
-    const msg = JSON.parse(data.toString());
-    if (msg.event === "start") {
-      streamSid = msg.start.streamSid;
-    } else if (msg.event === "media" && streamSid) {
-      // only send if OpenAI connection is ready
-      if (oai.readyState === WebSocket.OPEN) {
-        oai.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: msg.media.payload
-        }));
-      }
-    } else if (msg.event === "stop") {
-      try { oai.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
-      try { oai.close(); } catch {}
-      try { ws.close(); } catch {}
-    }
-  } catch (err) {
-    console.error("Error handling Twilio message:", err);
-  }
-});
-
-
+  // OpenAI -> Twilio
   oai.on("message", (data) => {
     try {
       const msg = JSON.parse(data.toString());
@@ -191,8 +196,9 @@ ws.on("message", (data) => {
     } catch {}
   });
 
-  oai.on("close", () => ws.close());
-  ws.on("close", () => oai.close());
+  oai.on("close", () => { try { ws.close(); } catch {} });
+  ws.on("close", () => { try { oai.close(); } catch {} });
+
 }
 
 // === Helper functions ===
