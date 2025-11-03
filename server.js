@@ -144,8 +144,9 @@ async function handleTwilio(ws, req) {
           voice: "alloy",
           modalities: ["audio"],
           input_audio_format: "g711_ulaw",   // Twilio -> us
-          output_audio_format: "pcm16",      // OpenAI -> us (we convert)
+          output_audio_format: "g711_ulaw",  // OpenAI -> us (match Twilio exactly)
           sample_rate: 8000,
+
           turn_detection: { type: "server_vad" },
           instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`
         }
@@ -154,9 +155,10 @@ async function handleTwilio(ws, req) {
         type: "response.create",
         response: {
           modalities: ["audio"],
-          audio: { format: "pcm16", sample_rate: 8000 },
+          audio: { format: "g711_ulaw", sample_rate: 8000 },
           instructions: `Deliver clearly and briefly: ${prompt}`
         }
+
       }));
     });
 
@@ -165,13 +167,13 @@ async function handleTwilio(ws, req) {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
-          const muB64 = pcm16leBase64ToMulawBase64(msg.delta);
           ws.send(JSON.stringify({
             event: "media",
             streamSid,
-            media: { payload: muB64 }
+            media: { payload: msg.delta }   // already μ-law @ 8k
           }));
         }
+
       } catch (err) {
         console.error("Error relaying OpenAI audio:", err);
       }
