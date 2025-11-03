@@ -150,8 +150,8 @@ async function handleTwilio(ws, req) {
       session: {
         voice: "alloy",
         modalities: ["audio"],
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
+        input_audio_format: "g711_ulaw",   // Twilio -> us (keep)
+        output_audio_format: "pcm16",      // OpenAI -> us (convert to μ-law ourselves)
         sample_rate: 8000,
         turn_detection: { type: "server_vad" },
         instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`,
@@ -191,10 +191,19 @@ async function handleTwilio(ws, req) {
     try {
       const msg = JSON.parse(data.toString());
       if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
-        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
+        // Convert PCM16 (base64) -> μ-law (base64) for Twilio
+        const muB64 = pcm16leBase64ToMulawBase64(msg.delta);
+        ws.send(JSON.stringify({
+          event: "media",
+          streamSid: streamSid,
+          media: { payload: muB64 }
+        }));
       }
-    } catch {}
+    } catch (err) {
+      console.error("Error relaying OpenAI audio:", err);
+    }
   });
+  
 
   oai.on("close", () => { try { ws.close(); } catch {} });
   ws.on("close", () => { try { oai.close(); } catch {} });
@@ -224,3 +233,32 @@ async function sendGroupMe(text) {
     body: JSON.stringify({ bot_id: process.env.GROUPME_BOT_ID, text }),
   });
 }
+
+// --- PCM16LE (8k) -> μ-law base64 for Twilio Stream ---
+function pcm16leBase64ToMulawBase64(b64) {
+  const buf = Buffer.from(b64, "base64");
+  const out = Buffer.alloc(Math.floor(buf.length / 2));
+  const BIAS = 0x84;
+
+  for (let i = 0, j = 0; i + 1 < buf.length; i += 2, j++) {
+    // little-endian 16-bit signed
+    let sample = buf.readInt16LE(i); // -32768..32767
+    let sign = (sample >> 8) & 0x80;
+    if (sample < 0) sample = -sample;
+    if (sample > 32635) sample = 32635;
+    sample = sample + BIAS;
+
+    // find exponent
+    let exponent = 7;
+    for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
+
+    // mantissa
+    const mantissa = (sample >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+
+    // μ-law encode (invert bits)
+    const mu = ~(sign | (exponent << 4) | mantissa) & 0xff;
+    out[j] = mu;
+  }
+  return out.toString("base64");
+}
+
