@@ -136,17 +136,13 @@ async function handleTwilio(ws, req) {
     );
 
     oai.on("open", () => {
-      oaiReady = true;
-      // Ask for PCM16 @ 8k from OpenAI; we’ll convert to μ-law for Twilio
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
           voice: "alloy",
           modalities: ["audio"],
-          input_audio_format: "g711_ulaw",   // Twilio -> us
-          output_audio_format: "g711_ulaw",  // OpenAI -> us (match Twilio exactly)
-          sample_rate: 8000,
-
+          input_audio_format: "g711_ulaw",   // Twilio -> us (we receive μ-law from Twilio)
+          output_audio_format: "pcm16",      // OpenAI -> us (we’ll downsample + μ-law)
           turn_detection: { type: "server_vad" },
           instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`
         }
@@ -155,29 +151,31 @@ async function handleTwilio(ws, req) {
         type: "response.create",
         response: {
           modalities: ["audio"],
-          audio: { format: "g711_ulaw", sample_rate: 8000 },
+          audio: { format: "pcm16" },  // let OpenAI default to 16 kHz; we’ll resample
           instructions: `Deliver clearly and briefly: ${prompt}`
         }
-
       }));
     });
+
 
     // OpenAI -> Twilio (PCM16@8k -> μ-law)
     oai.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "response.audio.delta" && msg.delta && streamSid) {
+          // Convert OpenAI PCM16@16k → PCM16@8k → μ-law → base64
+          const muB64 = pcm16le16kToMulaw8k(msg.delta);
           ws.send(JSON.stringify({
             event: "media",
             streamSid,
-            media: { payload: msg.delta }   // already μ-law @ 8k
+            media: { payload: muB64 }
           }));
         }
-
       } catch (err) {
         console.error("Error relaying OpenAI audio:", err);
       }
     });
+
 
     oai.on("close", () => { try { ws.close(); } catch {} });
   }
@@ -303,3 +301,38 @@ function pcm16leBase64ToMulawBase64(b64) {
   return out.toString("base64");
 }
 
+// Downsample PCM16LE 16 kHz → 8 kHz, then μ-law encode for Twilio (base64)
+function pcm16le16kToMulaw8k(b64) {
+  const buf = Buffer.from(b64, "base64");
+  // 16-bit little-endian samples → Int16 array
+  const sampleCount16k = Math.floor(buf.length / 2);
+  // Downsample by 2 (naive decimation): take every other sample
+  const out8kCount = Math.floor(sampleCount16k / 2);
+
+  // μ-law output bytes (1 byte per 8k sample)
+  const out = Buffer.alloc(out8kCount);
+  const BIAS = 0x84;
+
+  let j = 0;
+  for (let i = 0; i + 3 < buf.length; i += 4) {
+    // Take every other sample: use the first of each 2-sample pair
+    const sample = buf.readInt16LE(i); // little-endian 16-bit signed
+    let s = sample;
+    let sign = (s >> 8) & 0x80;
+    if (s < 0) s = -s;
+    if (s > 32635) s = 32635;
+    s = s + BIAS;
+
+    // exponent
+    let exponent = 7;
+    for (let expMask = 0x4000; (s & expMask) === 0 && exponent > 0; expMask >>= 1) exponent--;
+
+    // mantissa
+    const mantissa = (s >> ((exponent === 0) ? 4 : (exponent + 3))) & 0x0F;
+
+    // μ-law encode (invert bits)
+    const mu = ~(sign | (exponent << 4) | mantissa) & 0xff;
+    out[j++] = mu;
+  }
+  return out.toString("base64");
+}
