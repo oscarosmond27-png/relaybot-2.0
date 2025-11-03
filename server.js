@@ -144,14 +144,13 @@ async function handleTwilio(ws, req) {
   let oaiReady = false;
 
   oai.on("open", () => {
-    oaiReady = true;
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
         voice: "alloy",
         modalities: ["audio"],
-        input_audio_format: "g711_ulaw",   // Twilio -> us (keep)
-        output_audio_format: "pcm16",      // OpenAI -> us (convert to μ-law ourselves)
+        input_audio_format: "g711_ulaw",   // Twilio -> us
+        output_audio_format: "pcm16",      // OpenAI -> us (we convert to μ-law)
         sample_rate: 8000,
         turn_detection: { type: "server_vad" },
         instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`,
@@ -159,9 +158,14 @@ async function handleTwilio(ws, req) {
     }));
     oai.send(JSON.stringify({
       type: "response.create",
-      response: { modalities: ["audio"] }
+      response: {
+        modalities: ["audio"],
+        audio: { format: "pcm16", sample_rate: 8000 },
+        instructions: `Deliver clearly and briefly: ${prompt}`
+      }
     }));
   });
+
 
   // Twilio -> OpenAI (guard until OPEN)
   ws.on("message", (data) => {
