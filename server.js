@@ -81,6 +81,10 @@ app.get("/twiml", (req, res) => {
     `</Connect>` +
     `</Response>`;
 
+  
+  res.set("Content-Type", "text/xml").send(xml);
+});
+  
 
 // === WebSocket audio bridge (Twilio <-> OpenAI) ===
 const server = app.listen(process.env.PORT || 10000, () =>
