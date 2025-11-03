@@ -140,21 +140,22 @@ async function handleTwilio(ws, req) {
         type: "session.update",
         session: {
           voice: "alloy",
-          modalities: ["audio"],
-          input_audio_format: "g711_ulaw",   // Twilio -> us (we receive μ-law from Twilio)
-          output_audio_format: "pcm16",      // OpenAI -> us (we’ll downsample + μ-law)
+          modalities: ["audio", "text"],      // ✅ must include both
+          input_audio_format: "g711_ulaw",    // Twilio -> us
+          output_audio_format: "pcm16",       // OpenAI -> us (we’ll downsample + μ-law)
           turn_detection: { type: "server_vad" },
           instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`
         }
+
       }));
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio"],
-          audio: { format: "pcm16" },  // let OpenAI default to 16 kHz; we’ll resample
           instructions: `Deliver clearly and briefly: ${prompt}`
         }
       }));
+
     });
 
 
