@@ -110,49 +110,21 @@ server.on("upgrade", (req, socket, head) => {
 async function handleTwilio(ws, req) {
   console.log("WS handler entered with URL:", req.url);
 
-  // We'll fill these from Twilio's "start" event custom parameters
+  // State we’ll fill once Twilio sends "start"
   let prompt = "test";
-  let loop = false;
+  let echoMode = false;
   let streamSid = null;
+  let started = false;
 
-  // Wait for the first message (Twilio always sends a "start" event first)
-  ws.once("message", (firstBuf) => {
-    try {
-      const first = JSON.parse(firstBuf.toString());
-      if (first.event !== "start") {
-        console.warn("Expected 'start' event first, got:", first.event);
-      } else {
-        streamSid = first.start?.streamSid || null;
-        const cp = first.start?.customParameters || {};
-        if (typeof cp.prompt === "string" && cp.prompt.trim()) prompt = cp.prompt.trim();
-        if (cp.loop === "1") loop = true;
-      }
-    } catch (e) {
-      console.error("Failed to parse first Twilio message:", e);
-    }
+  // OpenAI socket + state (created lazily after "start" if not echo)
+  let oai = null;
+  let oaiReady = false;
 
-    // If loopback requested, set echo handlers and return (no OpenAI)
-    if (loop) {
-      console.log("Loopback mode enabled");
-      ws.on("message", (buf) => {
-        try {
-          const msg = JSON.parse(buf.toString());
-          if (msg.event === "media" && streamSid) {
-            ws.send(JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: msg.media.payload }
-            }));
-          } else if (msg.event === "stop") {
-            try { ws.close(); } catch {}
-          }
-        } catch {}
-      });
-      return;
-    }
+  // Helper to spin up OpenAI once (after "start")
+  function ensureOpenAI() {
+    if (oai) return; // already created
 
-    // ---- OpenAI Realtime connection (we'll forward audio both ways)
-    const oai = new WebSocket(
+    oai = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
       "realtime",
       {
@@ -163,24 +135,21 @@ async function handleTwilio(ws, req) {
       }
     );
 
-    let oaiReady = false;
-
     oai.on("open", () => {
       oaiReady = true;
-      // Session config: we receive PCM16@8k from OpenAI and convert to μ-law for Twilio
+      // Ask for PCM16 @ 8k from OpenAI; we’ll convert to μ-law for Twilio
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
           voice: "alloy",
           modalities: ["audio"],
           input_audio_format: "g711_ulaw",   // Twilio -> us
-          output_audio_format: "pcm16",      // OpenAI -> us (we convert to μ-law)
+          output_audio_format: "pcm16",      // OpenAI -> us (we convert)
           sample_rate: 8000,
           turn_detection: { type: "server_vad" },
           instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`
         }
       }));
-      // Pin the response format to PCM16@8k too
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
@@ -191,28 +160,7 @@ async function handleTwilio(ws, req) {
       }));
     });
 
-    // Twilio -> OpenAI (guard until OpenAI socket is ready)
-    ws.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.event === "media" && streamSid) {
-          if (oaiReady && oai.readyState === WebSocket.OPEN) {
-            oai.send(JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: msg.media.payload
-            }));
-          }
-        } else if (msg.event === "stop") {
-          try { oai.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
-          try { oai.close(); } catch {}
-          try { ws.close(); } catch {}
-        }
-      } catch (err) {
-        console.error("Error handling Twilio message:", err);
-      }
-    });
-
-    // OpenAI -> Twilio (convert PCM16@8k -> μ-law for Twilio)
+    // OpenAI -> Twilio (PCM16@8k -> μ-law)
     oai.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
@@ -230,9 +178,75 @@ async function handleTwilio(ws, req) {
     });
 
     oai.on("close", () => { try { ws.close(); } catch {} });
-    ws.on("close", () => { try { oai.close(); } catch {} });
-  }); // end once('message' for start)
+  }
+
+  // Single message handler to process connected -> start -> media -> stop
+  ws.on("message", (buf) => {
+    let msg;
+    try {
+      msg = JSON.parse(buf.toString());
+    } catch {
+      return;
+    }
+
+    if (msg.event === "connected") {
+      // First event from Twilio Media Streams. Nothing to do yet.
+      return;
+    }
+
+    if (msg.event === "start" && !started) {
+      started = true;
+      streamSid = msg.start?.streamSid || null;
+      const cp = msg.start?.customParameters || {};
+      if (typeof cp.prompt === "string" && cp.prompt.trim()) prompt = cp.prompt.trim();
+      echoMode = (cp.loop === "1");
+
+      console.log("Start received. prompt:", prompt, "echoMode:", echoMode);
+
+      if (echoMode) {
+        console.log("Loopback mode enabled");
+        return; // stay in the same ws.on('message') handler; we’ll echo 'media' below
+      } else {
+        ensureOpenAI();
+        return;
+      }
+    }
+
+    if (msg.event === "media" && streamSid) {
+      if (echoMode) {
+        // Bounce caller audio back unchanged
+        ws.send(JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: msg.media.payload }
+        }));
+      } else {
+        // Forward to OpenAI only when ready
+        if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
+          oai.send(JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: msg.media.payload
+          }));
+        }
+      }
+      return;
+    }
+
+    if (msg.event === "stop") {
+      if (oai && oaiReady) {
+        try { oai.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
+        try { oai.close(); } catch {}
+      }
+      try { ws.close(); } catch {}
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    try { if (oai) oai.close(); } catch {}
+  });
 }
+
 
 
 // === Helper functions ===
