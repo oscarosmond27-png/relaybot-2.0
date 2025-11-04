@@ -29,8 +29,7 @@ app.post("/groupme", async (req, res) => {
       return res.send("ok");
     }
 
-    const twimlUrl = `${process.env.BASE_URL}/twiml?prompt=${encodeURIComponent(prompt)}`;
-    const call = await makeTwilioCall(to, twimlUrl);
+    const call = await makeTwilioCallWithTwiml(to, prompt);
 
     if (!call.ok) {
       await sendGroupMe("Twilio call failed.");
@@ -277,12 +276,34 @@ function normalizePhone(s) {
   return null;
 }
 
-async function makeTwilioCall(to, twimlUrl) {
+async function makeTwilioCallWithTwiml(to, promptText) {
   const api = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls.json`;
-  const params = new URLSearchParams({ To: to, From: process.env.TWILIO_FROM_NUMBER, Url: twimlUrl });
   const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString("base64");
-  return fetch(api, { method: "POST", headers: { Authorization: `Basic ${auth}` }, body: params });
+
+  // escape prompt for XML attribute
+  const safePrompt = String(promptText).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+
+  const twiml =
+    `<?xml version="1.0" encoding="UTF-8"?><Response>` +
+    `<Say>Hello, I have a quick message for you.</Say>` +
+    `<Connect><Stream url="wss://${process.env.BASE_HOST || "relaybot-2-0.onrender.com"}/twilio">` +
+    `<Parameter name="prompt" value="${safePrompt}"/>` +
+    `<Parameter name="loop" value="0"/>` +
+    `</Stream></Connect></Response>`;
+
+  const body = new URLSearchParams({
+    To: to,
+    From: process.env.TWILIO_FROM_NUMBER,
+    Twiml: twiml
+  });
+
+  return fetch(api, {
+    method: "POST",
+    headers: { Authorization: `Basic ${auth}` },
+    body
+  });
 }
+
 
 async function sendGroupMe(text) {
   await fetch("https://api.groupme.com/v3/bots/post", {
