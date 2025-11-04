@@ -151,10 +151,11 @@ async function handleTwilio(ws, req) {
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
-          modalities: ["audio"],
+          modalities: ["audio", "text"],   // <-- add "text" here
           instructions: `Deliver clearly and briefly: ${prompt}`
         }
       }));
+
 
     });
 
