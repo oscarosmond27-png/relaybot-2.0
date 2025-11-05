@@ -162,14 +162,16 @@ async function handleTwilio(ws, req) {
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
-          voice: "alloy",
+          voice,                               // uses your sheet's voice (e.g., alloy)
           modalities: ["audio", "text"],
-          input_audio_format: "g711_ulaw",   // Twilio -> server (keep)
-          output_audio_format: "g711_ulaw",      // OpenAI -> server (we convert)
+          input_audio_format: "g711_ulaw",     // Twilio -> server
+          output_audio_format: "g711_ulaw",    // OpenAI -> server (pass-through)
+          sample_rate: 8000,                   // hard-pin 8 kHz to match Twilio
           turn_detection: { type: "server_vad" },
           instructions: `${system}\n\nRules:\n- Speak ONLY in clear American English.\n- Never switch languages.\n- Keep responses concise and natural.`
         }
       }));
+
       
 
 
@@ -187,8 +189,7 @@ async function handleTwilio(ws, req) {
 
 
 // OpenAI -> Twilio (PCM16@16k → μ-law@8k)
-{
-let warmupDrops = 4; // drop the first ~4 tiny frames to avoid pops/static
+let warmupDrops = 4; // drop a few initial frames to avoid static burst
 
 oai.on("message", (data) => {
   try {
@@ -197,17 +198,12 @@ oai.on("message", (data) => {
     const isDelta = (t === "response.audio.delta" || t === "response.output_audio.delta");
 
     if (isDelta && msg.delta && streamSid) {
-      // Skip a few initial frames to avoid the “burst”
-      if (warmupDrops > 0) { warmupDrops--; return; }
-
-      // Convert OpenAI PCM16 (base64, ~16k) → μ-law 8k for Twilio
-      const muB64 = pcm16le16kToMulaw8k(msg.delta);
-      if (!muB64) return;
-
+      if (warmupDrops > 0) { warmupDrops--; return; } // skip initial tiny frames
+      // μ-law @ 8k goes straight to Twilio — no conversion
       ws.send(JSON.stringify({
         event: "media",
         streamSid,
-        media: { payload: muB64 }
+        media: { payload: msg.delta }
       }));
     }
   } catch (err) {
@@ -215,7 +211,6 @@ oai.on("message", (data) => {
   }
 });
 
-}
 
 
 
