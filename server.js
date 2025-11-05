@@ -190,32 +190,51 @@ async function handleTwilio(ws, req) {
     // Handle both audio (for the call) and text (for the end-of-call summary)
     oai.on("message", async (data) => {
       try {
-        const msg = JSON.parse(data.toString());
+        const raw = data.toString();
+        let msg;
+        try { msg = JSON.parse(raw); } catch {
+          console.error("OpenAI non-JSON frame:", raw.slice(0, 120));
+          return;
+        }
+    
         const t = msg.type || "(no type)";
-
+    
+        // --- extra visibility while we wait for the summary ---
+        if (awaitingSummary) {
+          // log the type so we know what's coming back during summary phase
+          console.log("OAI event during summary:", t);
+        }
+    
         // 1) Audio streaming from OpenAI -> Twilio (unchanged)
-        if ((t === "response.audio.delta" || t === "response.output_audio.delta") && msg.delta && streamSid) {
+        const isAudioDelta =
+          (t === "response.audio.delta" || t === "response.output_audio.delta");
+        if (isAudioDelta && msg.delta && streamSid) {
           ws.send(JSON.stringify({
             event: "media",
             streamSid,
             media: { payload: msg.delta }
           }));
         }
-
+    
         // 2) Text deltas (summary chunks)
-        if (awaitingSummary && t === "response.output_text.delta" && msg.delta) {
+        // Accept BOTH possible names: response.output_text.delta and response.text.delta
+        const isTextDelta =
+          (t === "response.output_text.delta" || t === "response.text.delta");
+        if (awaitingSummary && isTextDelta && msg.delta) {
           console.log("Summary token:", msg.delta);
           summaryText += msg.delta;
         }
-
-        // 3) Summary completion: send to GroupMe, then clean up the sockets
-        if (awaitingSummary && t === "response.completed") {
+    
+        // 3) Summary completion: there are a few possible "done" events
+        const isSummaryDone =
+          (t === "response.completed" || t === "response.complete" || t === "response.done");
+        if (awaitingSummary && isSummaryDone) {
           console.log("Summary complete:", summaryText);
           awaitingSummary = false;
           if (summaryTimeout) { clearTimeout(summaryTimeout); summaryTimeout = null; }
-          if (keepalive) { clearInterval(keepalive); keepalive = null; }   // <— fix: clear keepalive here
-
-          const text = summaryText.trim();
+          if (keepalive) { clearInterval(keepalive); keepalive = null; }
+    
+          const text = (summaryText || "").trim();
           summaryText = "";
           if (text) {
             try { await sendGroupMe(`📝 Call summary: ${text}`); }
@@ -226,12 +245,22 @@ async function handleTwilio(ws, req) {
           // after we’ve posted the summary, close sockets
           try { oai.close(); } catch {}
           try { ws.close(); } catch {}
+          return;
         }
-
+    
+        // 4) Defensive: sometimes models send a single text blob as 'response.output_text' (no .delta)
+        if (awaitingSummary && (t === "response.output_text" || t === "response.text")) {
+          const txt = (msg.text || msg.output_text || "").trim();
+          if (txt) {
+            summaryText += txt;
+          }
+        }
+    
       } catch (err) {
         console.error("Error relaying OpenAI message:", err);
       }
     });
+
 
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
     oai.on("close", () => {
