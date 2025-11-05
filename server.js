@@ -200,7 +200,12 @@ async function handleTwilio(ws, req) {
             media: { payload: msg.delta }
           }));
         }
-    
+
+        if (awaitingSummary && t === "response.output_text.delta" && msg.delta) {
+          console.log("Summary token:", msg.delta);
+          summaryText += msg.delta;
+        }
+        
         // 2) Text deltas (summary chunks)
         if (awaitingSummary && t === "response.output_text.delta" && msg.delta) {
           summaryText += msg.delta;
@@ -208,6 +213,7 @@ async function handleTwilio(ws, req) {
     
         // 3) Summary completion: send to GroupMe, then clean up the sockets
         if (awaitingSummary && t === "response.completed") {
+          console.log("Summary complete:", summaryText);
           awaitingSummary = false;
           if (summaryTimeout) { clearTimeout(summaryTimeout); summaryTimeout = null; }
           const text = summaryText.trim();
@@ -344,6 +350,8 @@ async function handleTwilio(ws, req) {
           // Small delay to let OpenAI finish its last turn
           await new Promise(r => setTimeout(r, 1000));
 
+          console.log("Requesting summary from OpenAI...");
+
           // Ask the same realtime session for a short text summary of the call.
           awaitingSummary = true;
           summaryText = "";
@@ -356,13 +364,13 @@ async function handleTwilio(ws, req) {
               try { oai.close(); } catch {}
               try { ws.close(); } catch {}
             }
-          }, 25000);
+          }, 40000);
 
           oai.send(JSON.stringify({
             type: "response.create",
             response: {
               modalities: ["text"],
-              instructions: "Briefly summarize the entire phone conversation that just ended. Include key topics or replies. Keep it under 3 sentences."
+              instructions: "Summarize the phone conversation that just ended in 2–3 complete sentences. Include who spoke and what was said. Respond immediately."
             }
           }));
 
