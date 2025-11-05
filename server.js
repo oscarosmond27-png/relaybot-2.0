@@ -127,10 +127,10 @@ async function handleTwilio(ws, req) {
   let streamSid = null;
   let started = false;
 
-  // summary capture state
+  // --- summary capture state ---
   let awaitingSummary = false;
   let summaryText = "";
-
+  let summaryTimeout = null;
 
   // OpenAI socket + state (created lazily after "start" if not echo)
   let oai = null;
@@ -201,7 +201,7 @@ async function handleTwilio(ws, req) {
           }));
         }
     
-        // 2) Text deltas (we only care when we're awaiting the summary)
+        // 2) Text deltas (summary chunks)
         if (awaitingSummary && t === "response.output_text.delta" && msg.delta) {
           summaryText += msg.delta;
         }
@@ -209,6 +209,7 @@ async function handleTwilio(ws, req) {
         // 3) Summary completion: send to GroupMe, then clean up the sockets
         if (awaitingSummary && t === "response.completed") {
           awaitingSummary = false;
+          if (summaryTimeout) { clearTimeout(summaryTimeout); summaryTimeout = null; }
           const text = summaryText.trim();
           summaryText = "";
           if (text) {
@@ -217,6 +218,10 @@ async function handleTwilio(ws, req) {
             } catch (e) {
               console.error("Failed to send summary to GroupMe:", e);
             }
+          } else {
+            try {
+              await sendGroupMe("📝 Call summary unavailable.");
+            } catch {}
           }
           // after we’ve posted the summary, close sockets
           try { oai.close(); } catch {}
@@ -228,13 +233,13 @@ async function handleTwilio(ws, req) {
       }
     });
 
-
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
     oai.on("close", () => {
       clearInterval(pingIv);
-      try {
-        ws.close();
-      } catch {}
+      // Only force-close Twilio if we're NOT waiting on a summary
+      if (!awaitingSummary) {
+        try { ws.close(); } catch {}
+      }
     });
   }
 
@@ -333,9 +338,23 @@ async function handleTwilio(ws, req) {
     if (msg.event === "stop") {
       if (oai && oaiReady) {
         try {
+          // Finalize any buffered input before summary
+          oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+
           // Ask the same realtime session for a short text summary of the call.
           awaitingSummary = true;
           summaryText = "";
+
+          // Safety timeout in case the summary never arrives
+          summaryTimeout = setTimeout(async () => {
+            if (awaitingSummary) {
+              awaitingSummary = false;
+              try { await sendGroupMe("📝 Call summary unavailable (timeout)."); } catch {}
+              try { oai.close(); } catch {}
+              try { ws.close(); } catch {}
+            }
+          }, 12000);
+
           oai.send(JSON.stringify({
             type: "response.create",
             response: {
@@ -343,6 +362,7 @@ async function handleTwilio(ws, req) {
               instructions: "Summarize the conversation that just occurred in 2–3 concise sentences."
             }
           }));
+
           // IMPORTANT: stop here so we don't close sockets before we get the summary.
           return;
         } catch (err) {
@@ -365,9 +385,10 @@ async function handleTwilio(ws, req) {
     }
   });
 
+  // Don't kill OpenAI while we're waiting on the summary
   ws.on("close", () => {
     try {
-      if (oai) oai.close();
+      if (oai && !awaitingSummary) oai.close();
     } catch {}
   });
 }
