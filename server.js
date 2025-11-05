@@ -352,7 +352,7 @@ async function makeTwilioCallWithTwiml(to, promptText) {
 
   const twiml =
     `<?xml version="1.0" encoding="UTF-8"?><Response>` +
-    `<Say>Hello, I have a quick message for you.</Say>` +
+    //`<Say>Hello, I have a quick message for you.</Say>` +
     `<Connect><Stream url="${streamUrl}">` +
     `<Parameter name="prompt" value="${safePrompt}"/>` +
     `<Parameter name="loop" value="0"/>` +
