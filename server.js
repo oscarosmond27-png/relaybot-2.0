@@ -246,7 +246,7 @@ async function handleTwilio(ws, req) {
   ws.on("error", (err) => console.error("Twilio WS error:", err));
 
   // Single message handler to process connected -> start -> media -> stop
-  ws.on("message", (buf) => {
+  ws.on("message", async (buf) => {
     let msg;
     try {
       msg = JSON.parse(buf.toString());
