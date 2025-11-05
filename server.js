@@ -164,14 +164,14 @@ async function handleTwilio(ws, req) {
         session: {
           voice,
           modalities: ["audio", "text"],
-          input_audio_format: "g711_ulaw",     // Twilio -> server
-          output_audio_format: "pcm16",        // OpenAI -> server (we convert)
-          sample_rate: 16000,                  // pin to 16k so our converter is correct
+          input_audio_format: "g711_ulaw",   // Twilio -> server
+          output_audio_format: "g711_ulaw",  // OpenAI -> server (ready for Twilio)
+          sample_rate: 8000,                 // lock to 8k to match Twilio
           turn_detection: { type: "server_vad" },
-          // Sheet system prompt + hard English pin
           instructions: `${system}\n\nRules:\n- Speak ONLY in clear American English.\n- Never switch languages.\n- Keep responses concise and natural.`
         }
       }));
+
 
 
       // Opening turn built from sheet template (includes your ${PROMPT})
@@ -188,31 +188,30 @@ async function handleTwilio(ws, req) {
 
 // OpenAI -> Twilio (PCM16@16k → μ-law@8k)
 {
-  let droppedFirst = false; // avoid the initial tiny pop frame
+let droppedFirst = false;
 
   oai.on("message", (data) => {
     try {
       const msg = JSON.parse(data.toString());
       const t = msg.type || "(no type)";
       const isDelta = (t === "response.audio.delta" || t === "response.output_audio.delta");
-
+  
       if (isDelta && msg.delta && streamSid) {
-        // Drop the very first frame to avoid a “pop”
+        // Drop the very first tiny frame to avoid a pop/static burst
         if (!droppedFirst) { droppedFirst = true; return; }
-
-        // Convert OpenAI PCM16 (base64 @ ~16k) → μ-law 8k base64 for Twilio
-        const muB64 = pcm16le16kToMulaw8k(msg.delta);
-
+  
+        // Pass μ-law @8k straight to Twilio
         ws.send(JSON.stringify({
           event: "media",
           streamSid,
-          media: { payload: muB64 }
+          media: { payload: msg.delta }
         }));
       }
     } catch (err) {
       console.error("Error relaying OpenAI audio:", err);
     }
   });
+
 }
 
 
