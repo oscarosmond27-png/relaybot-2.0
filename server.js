@@ -143,15 +143,15 @@ async function handleTwilio(ws, req) {
           input_audio_format: "g711_ulaw",    // Twilio -> us
           output_audio_format: "g711_ulaw",  // match Twilio exactly
           turn_detection: { type: "server_vad" },
-          instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`
+          instructions: `You are a friendly phone agent. Speak ONLY in clear American English. Never switch languages. Be concise and natural.`
         }
 
       }));
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
-          modalities: ["audio", "text"],   // <-- add "text" here
-          instructions: `Deliver clearly and briefly: ${prompt}`
+          modalities: ["audio","text"],
+          instructions: `Say exactly: "${prompt}". Then ask: "Anything else?"`
         }
       }));
 
