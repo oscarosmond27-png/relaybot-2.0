@@ -142,7 +142,7 @@ async function handleTwilio(ws, req) {
     if (oai) return; // already created
 
     oai = new WebSocket(
-      `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
+      `wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview`,
       "realtime",
       {
         headers: {
@@ -165,7 +165,7 @@ async function handleTwilio(ws, req) {
         JSON.stringify({
           type: "session.update",
           session: {
-            voice: "echo",
+            voice: "coral",
             modalities: ["audio", "text"], // must include both
             input_audio_format: "g711_ulaw", // Twilio -> us
             output_audio_format: "g711_ulaw", // match Twilio exactly
@@ -341,6 +341,9 @@ async function handleTwilio(ws, req) {
           // Finalize any buffered input before summary
           oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
 
+          // Small delay to let OpenAI finish its last turn
+          await new Promis(r => setTimeout(r, 1000));
+
           // Ask the same realtime session for a short text summary of the call.
           awaitingSummary = true;
           summaryText = "";
@@ -353,13 +356,13 @@ async function handleTwilio(ws, req) {
               try { oai.close(); } catch {}
               try { ws.close(); } catch {}
             }
-          }, 12000);
+          }, 25000);
 
           oai.send(JSON.stringify({
             type: "response.create",
             response: {
               modalities: ["text"],
-              instructions: "Summarize the conversation that just occurred in 2–3 concise sentences."
+              instructions: "Briefly summarize the entire phone conversation that just ended. Include key topics or replies. Keep it under 3 sentences."
             }
           }));
 
