@@ -342,7 +342,7 @@ async function handleTwilio(ws, req) {
           oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
 
           // Small delay to let OpenAI finish its last turn
-          await new Promis(r => setTimeout(r, 1000));
+          await new Promise(r => setTimeout(r, 1000));
 
           // Ask the same realtime session for a short text summary of the call.
           awaitingSummary = true;
