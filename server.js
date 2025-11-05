@@ -141,7 +141,7 @@ async function handleTwilio(ws, req) {
           voice: "alloy",
           modalities: ["audio", "text"],      // ✅ must include both
           input_audio_format: "g711_ulaw",    // Twilio -> us
-          output_audio_format: "pcm16",       // OpenAI -> us (we’ll downsample + μ-law)
+          output_audio_format: "g711_ulaw",  // match Twilio exactly
           turn_detection: { type: "server_vad" },
           instructions: `You are a friendly assistant speaking to a person on a phone call. Repeat back or respond clearly in natural English to: ${prompt}`
         }
@@ -160,38 +160,27 @@ async function handleTwilio(ws, req) {
 
 
     // OpenAI -> Twilio (PCM16@8k -> μ-law)
-    oai.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        const t = msg.type || "(no type)";
-        console.log("OAI msg type:", t);
-    
-        // OpenAI can use either of these event names for audio frames
-        const isDelta =
-          (t === "response.audio.delta" || t === "response.output_audio.delta");
-    
-        if (isDelta && msg.delta && streamSid) {
-          // If you're on the PCM16->8k->mulaw path:
-          // const muB64 = pcm16le16kToMulaw8k(msg.delta);
-    
-          // If you're on the direct μ-law path:
-          const muB64 = msg.delta;
-    
-          ws.send(JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: muB64 }
-          }));
-          return;
-        }
-    
-        if (t === "error") {
-          console.error("OpenAI error:", msg);
-        }
-      } catch (err) {
-        console.error("Error relaying OpenAI audio:", err);
-      }
-    });
+oai.on("message", (data) => {
+  try {
+    const msg = JSON.parse(data.toString());
+    const t = msg.type || "(no type)";
+
+    // OpenAI can use either event name:
+    const isDelta = (t === "response.audio.delta" || t === "response.output_audio.delta");
+
+    if (isDelta && msg.delta && streamSid) {
+      // Forward μ-law @ 8k directly to Twilio
+      ws.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: msg.delta }
+      }));
+    }
+  } catch (err) {
+    console.error("Error relaying OpenAI audio:", err);
+  }
+});
+
 
 
 
