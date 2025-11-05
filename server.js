@@ -155,14 +155,14 @@ async function handleTwilio(ws, req) {
         session: {
           voice,
           modalities: ["audio", "text"],
-          input_audio_format: "g711_ulaw",   // Twilio -> server
-          output_audio_format: "g711_ulaw",  // server -> Twilio (no conversion pop)
-          sample_rate: 8000,
+          input_audio_format: "g711_ulaw",   // Twilio -> server (keep)
+          output_audio_format: "pcm16",      // OpenAI -> server (we’ll convert)
+          // no sample_rate here; OpenAI defaults to 16k for PCM
           turn_detection: { type: "server_vad" },
           instructions: system
         }
       }));
-    
+
       // Opening turn built from sheet template (includes your ${PROMPT})
       oai.send(JSON.stringify({
         type: "response.create",
@@ -175,27 +175,35 @@ async function handleTwilio(ws, req) {
 
 
 
-    // OpenAI -> Twilio (PCM16@8k -> μ-law)
-oai.on("message", (data) => {
-  try {
-    const msg = JSON.parse(data.toString());
-    const t = msg.type || "(no type)";
+// OpenAI -> Twilio (PCM16@16k → μ-law@8k)
+{
+  let droppedFirst = false; // avoid the initial tiny pop frame
 
-    // OpenAI can use either event name:
-    const isDelta = (t === "response.audio.delta" || t === "response.output_audio.delta");
+  oai.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      const t = msg.type || "(no type)";
+      const isDelta = (t === "response.audio.delta" || t === "response.output_audio.delta");
 
-    if (isDelta && msg.delta && streamSid) {
-      // Forward μ-law @ 8k directly to Twilio
-      ws.send(JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: msg.delta }
-      }));
+      if (isDelta && msg.delta && streamSid) {
+        // Drop the very first frame to avoid a “pop”
+        if (!droppedFirst) { droppedFirst = true; return; }
+
+        // Convert OpenAI PCM16 (base64 @ ~16k) → μ-law 8k base64 for Twilio
+        const muB64 = pcm16le16kToMulaw8k(msg.delta);
+
+        ws.send(JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: muB64 }
+        }));
+      }
+    } catch (err) {
+      console.error("Error relaying OpenAI audio:", err);
     }
-  } catch (err) {
-    console.error("Error relaying OpenAI audio:", err);
-  }
-});
+  });
+}
+
 
 
 
