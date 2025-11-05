@@ -162,11 +162,10 @@ async function handleTwilio(ws, req) {
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
-          voice,
+          voice: "alloy",
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",   // Twilio -> server (keep)
-          output_audio_format: "pcm16",      // OpenAI -> server (we convert)
-          sample_rate: 16000,                // pin to 16 kHz so our 16k→8k converter is correct
+          output_audio_format: "g711_ulaw",      // OpenAI -> server (we convert)
           turn_detection: { type: "server_vad" },
           instructions: `${system}\n\nRules:\n- Speak ONLY in clear American English.\n- Never switch languages.\n- Keep responses concise and natural.`
         }
@@ -257,44 +256,41 @@ oai.on("message", (data) => {
       }
     }
 
-  if (msg.event === "media" && streamSid) {
-    if (echoMode) {
-      // Bounce caller audio back unchanged
-      ws.send(JSON.stringify({
-        event: "media",
-        streamSid,
-        media: { payload: msg.media.payload }
+if (msg.event === "media" && streamSid) {
+  if (echoMode) {
+    // Bounce caller audio back unchanged
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: msg.media.payload }
+    }));
+  } else {
+    // Forward to OpenAI and auto-commit after brief silence
+    if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
+      // Append this audio chunk
+      oai.send(JSON.stringify({
+        type: "input_audio_buffer.append",
+        audio: msg.media.payload
       }));
-    } else {
-      // Forward to OpenAI and auto-commit after brief silence
-      if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
-        // Append this audio chunk
-        oai.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: msg.media.payload
-        }));
-  
-        // Debounce: when caller pauses, commit and ask for a reply
-        if (commitTimer) clearTimeout(commitTimer);
-        commitTimer = setTimeout(() => {
-          try {
-            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-            oai.send(JSON.stringify({
-              type: "response.create",
-              response: {
-                modalities: ["audio","text"],
-                instructions: "Respond in clear American English only."
-              }
-            }));
 
-          } catch (err) {
-            console.error("Commit/send error:", err);
-          }
-        }, DEBOUNCE_MS);
-      }
+      // Debounce: when caller pauses, commit and ask for a reply
+      if (commitTimer) clearTimeout(commitTimer);
+      commitTimer = setTimeout(() => {
+        try {
+          oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+          oai.send(JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["audio","text"] }
+          }));
+        } catch (err) {
+          console.error("Commit/send error:", err);
+        }
+      }, DEBOUNCE_MS);
     }
-    return;
   }
+  return;
+}
+
 
 
     if (msg.event === "stop") {
