@@ -84,7 +84,7 @@ app.get("/twiml", (req, res) => {
   const xml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
-    `<Say>Hello, I have a quick message for you.</Say>` +
+    //`<Say>Hello, I have a quick message for you.</Say>` +
     `<Connect>` +
     `  <Stream url="${wsUrl}">` +
     `    <Parameter name="prompt" value="${promptAttr}"/>` +
