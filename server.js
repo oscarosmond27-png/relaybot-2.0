@@ -83,16 +83,7 @@ app.get("/twiml", (req, res) => {
   
   res.set("Content-Type", "text/xml").send(xml);
 });
-
-// --- TEMP: debug the current Google Sheet config the server sees
-app.get("/cfg", async (_req, res) => {
-  try {
-    const cfg = await fetchSheetConfig();
-    res.json({ ok: true, cfg });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
-  }
-});
+  
 
 // === WebSocket audio bridge (Twilio <-> OpenAI) ===
 const server = app.listen(process.env.PORT || 10000, () =>
@@ -132,74 +123,57 @@ async function handleTwilio(ws, req) {
 
 
   // Helper to spin up OpenAI once (after "start")
-  async function ensureOpenAI() {
+  function ensureOpenAI() {
     if (oai) return; // already created
 
-  // Pull config for model/voice/prompts
-  // (safe fallback if sheet missing or fetch fails)
-  let cfg = {};
-  try { cfg = await fetchSheetConfig(); } catch {}
-  const model = cfg.model || "gpt-4o-realtime-preview";
-  const voice = cfg.voice || "alloy";
-  const { system, opening } = composePromptsFromConfig(cfg, prompt);
-  
-  oai = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`,
-    "realtime",
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
+    oai = new WebSocket(
+      `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
+      "realtime",
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+          "OpenAI-Beta": "realtime=v1"
+        }
       }
-    }
-  );
-
+    );
 
     oai.on("open", () => {
       oaiReady = true;
-    
-      // Session takes system behavior + codec settings
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
-          voice,                               // uses your sheet's voice (e.g., alloy)
-          modalities: ["audio", "text"],
-          input_audio_format: "g711_ulaw",     // Twilio -> server
-          output_audio_format: "g711_ulaw",    // OpenAI -> server (pass-through)
-          sample_rate: 8000,                   // hard-pin 8 kHz to match Twilio
+          voice: "alloy",
+          modalities: ["audio", "text"],      // ✅ must include both
+          input_audio_format: "g711_ulaw",    // Twilio -> us
+          output_audio_format: "g711_ulaw",  // match Twilio exactly
           turn_detection: { type: "server_vad" },
-          instructions: `${system}\n\nRules:\n- Speak ONLY in clear American English.\n- Never switch languages.\n- Keep responses concise and natural.`
+          instructions: `You are a friendly phone agent. Speak ONLY in clear American English. Never switch languages. Be concise and natural.`
         }
+
       }));
-
-      
-
-
-
-      // Opening turn built from sheet template (includes your ${PROMPT})
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
-          modalities: ["audio", "text"],
-          instructions: `${opening}\n(Respond in American English only.)`
+          modalities: ["audio","text"],
+          instructions: `Say exactly: "${prompt}". Then ask: "Anything else?"`
         }
       }));
+
+
     });
 
 
-
-// OpenAI -> Twilio (PCM16@16k → μ-law@8k)
-let warmupDrops = 4; // drop a few initial frames to avoid static burst
-
+    // OpenAI -> Twilio (PCM16@8k -> μ-law)
 oai.on("message", (data) => {
   try {
     const msg = JSON.parse(data.toString());
     const t = msg.type || "(no type)";
+
+    // OpenAI can use either event name:
     const isDelta = (t === "response.audio.delta" || t === "response.output_audio.delta");
 
     if (isDelta && msg.delta && streamSid) {
-      if (warmupDrops > 0) { warmupDrops--; return; } // skip initial tiny frames
-      // μ-law @ 8k goes straight to Twilio — no conversion
+      // Forward μ-law @ 8k directly to Twilio
       ws.send(JSON.stringify({
         event: "media",
         streamSid,
@@ -210,8 +184,6 @@ oai.on("message", (data) => {
     console.error("Error relaying OpenAI audio:", err);
   }
 });
-
-
 
 
 
@@ -246,46 +218,45 @@ oai.on("message", (data) => {
         console.log("Loopback mode enabled");
         return; // stay in the same ws.on('message') handler; we’ll echo 'media' below
       } else {
-        ensureOpenAI().catch(err => console.error("ensureOpenAI error:", err));
+        ensureOpenAI();
         return;
       }
     }
 
-if (msg.event === "media" && streamSid) {
-  if (echoMode) {
-    // Bounce caller audio back unchanged
-    ws.send(JSON.stringify({
-      event: "media",
-      streamSid,
-      media: { payload: msg.media.payload }
-    }));
-  } else {
-    // Forward to OpenAI and auto-commit after brief silence
-    if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
-      // Append this audio chunk
-      oai.send(JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: msg.media.payload
+  if (msg.event === "media" && streamSid) {
+    if (echoMode) {
+      // Bounce caller audio back unchanged
+      ws.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: msg.media.payload }
       }));
-
-      // Debounce: when caller pauses, commit and ask for a reply
-      if (commitTimer) clearTimeout(commitTimer);
-      commitTimer = setTimeout(() => {
-        try {
-          oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-          oai.send(JSON.stringify({
-            type: "response.create",
-            response: { modalities: ["audio","text"] }
-          }));
-        } catch (err) {
-          console.error("Commit/send error:", err);
-        }
-      }, DEBOUNCE_MS);
+    } else {
+      // Forward to OpenAI and auto-commit after brief silence
+      if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
+        // Append this audio chunk
+        oai.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: msg.media.payload
+        }));
+  
+        // Debounce: when caller pauses, commit and ask for a reply
+        if (commitTimer) clearTimeout(commitTimer);
+        commitTimer = setTimeout(() => {
+          try {
+            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+            oai.send(JSON.stringify({
+              type: "response.create",
+              response: { modalities: ["audio","text"] }
+            }));
+          } catch (err) {
+            console.error("Commit/send error:", err);
+          }
+        }, DEBOUNCE_MS);
+      }
     }
+    return;
   }
-  return;
-}
-
 
 
     if (msg.event === "stop") {
@@ -351,57 +322,6 @@ async function sendGroupMe(text) {
   });
 }
 
-// ---- Google Sheet config fetch (CSV: key,value) with simple in-memory cache
-let _sheetCache = { at: 0, ttl: Number(process.env.SHEET_CACHE_TTL_MS || 30000), data: null };
-
-async function fetchSheetConfig() {
-  const now = Date.now();
-  if (_sheetCache.data && (now - _sheetCache.at) < _sheetCache.ttl) return _sheetCache.data;
-
-  const url = process.env.SHEET_CSV_URL;
-  if (!url) return {}; // no sheet configured
-
-  const r = await fetch(url, { method: "GET" });
-  if (!r.ok) throw new Error("Sheet fetch failed: " + r.status);
-  const csv = await r.text();
-
-  // Parse very simply: key,value (CSV with optional quotes)
-  const lines = csv.split(/\r?\n/).filter(Boolean);
-  const out = {};
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (i === 0 && /key/i.test(line) && /value/i.test(line)) continue; // skip header
-    // basic CSV split respecting double quotes
-    const cells = [];
-    let cur = "", inQ = false;
-    for (let c of line) {
-      if (c === '"' ) { inQ = !inQ; continue; }
-      if (c === ',' && !inQ) { cells.push(cur); cur = ""; continue; }
-      cur += c;
-    }
-    cells.push(cur);
-    const k = (cells[0] || "").trim();
-    const v = (cells[1] || "").trim();
-    if (k) out[k] = v;
-  }
-
-  _sheetCache = { at: now, ttl: _sheetCache.ttl, data: out };
-  return out;
-}
-
-// Build final instruction strings from sheet + the GroupMe prompt
-function composePromptsFromConfig(cfg, userPrompt) {
-  const sys = cfg.system_instructions || `You are a friendly phone agent. Speak ONLY in clear American English. Be concise and natural.`;
-  const extra = cfg.extra_knowledge ? `\n\nContext:\n${cfg.extra_knowledge}` : "";
-  const system = sys + extra;
-
-  // Opening line template supports ${PROMPT}
-  const openingTemplate = cfg.opening_line || `Say exactly: "${'${PROMPT}'}". Then ask: "Anything else?"`;
-  const opening = openingTemplate.replace(/\$\{PROMPT\}/g, userPrompt);
-
-  return { system, opening };
-}
-
 // --- PCM16LE (8k) -> μ-law base64 for Twilio Stream ---
 function pcm16leBase64ToMulawBase64(b64) {
   const buf = Buffer.from(b64, "base64");
@@ -465,3 +385,4 @@ function pcm16le16kToMulaw8k(b64) {
   }
   return out.toString("base64");
 }
+
