@@ -123,7 +123,7 @@ async function handleTwilio(ws, req) {
 
 
   // Helper to spin up OpenAI once (after "start")
-  function ensureOpenAI() {
+  async function ensureOpenAI() {
     if (oai) return; // already created
 
   // Pull config for model/voice/prompts
@@ -230,7 +230,7 @@ oai.on("message", (data) => {
         console.log("Loopback mode enabled");
         return; // stay in the same ws.on('message') handler; we’ll echo 'media' below
       } else {
-        ensureOpenAI();
+        ensureOpenAI().catch(err => console.error("ensureOpenAI error:", err));
         return;
       }
     }
