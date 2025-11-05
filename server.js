@@ -83,7 +83,16 @@ app.get("/twiml", (req, res) => {
   
   res.set("Content-Type", "text/xml").send(xml);
 });
-  
+
+// --- TEMP: debug the current Google Sheet config the server sees
+app.get("/cfg", async (_req, res) => {
+  try {
+    const cfg = await fetchSheetConfig();
+    res.json({ ok: true, cfg });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  }
+});
 
 // === WebSocket audio bridge (Twilio <-> OpenAI) ===
 const server = app.listen(process.env.PORT || 10000, () =>
