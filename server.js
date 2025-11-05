@@ -118,6 +118,9 @@ async function handleTwilio(ws, req) {
   // OpenAI socket + state (created lazily after "start" if not echo)
   let oai = null;
   let oaiReady = false;
+  let commitTimer = null;
+  const DEBOUNCE_MS = 700;  // try 500–900ms if you want faster/slower replies
+
 
   // Helper to spin up OpenAI once (after "start")
   function ensureOpenAI() {
@@ -135,6 +138,7 @@ async function handleTwilio(ws, req) {
     );
 
     oai.on("open", () => {
+      oaiReady = true;
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -219,25 +223,41 @@ oai.on("message", (data) => {
       }
     }
 
-    if (msg.event === "media" && streamSid) {
-      if (echoMode) {
-        // Bounce caller audio back unchanged
-        ws.send(JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: msg.media.payload }
+  if (msg.event === "media" && streamSid) {
+    if (echoMode) {
+      // Bounce caller audio back unchanged
+      ws.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: msg.media.payload }
+      }));
+    } else {
+      // Forward to OpenAI and auto-commit after brief silence
+      if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
+        // Append this audio chunk
+        oai.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: msg.media.payload
         }));
-      } else {
-        // Forward to OpenAI only when ready
-        if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
-          oai.send(JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: msg.media.payload
-          }));
-        }
+  
+        // Debounce: when caller pauses, commit and ask for a reply
+        if (commitTimer) clearTimeout(commitTimer);
+        commitTimer = setTimeout(() => {
+          try {
+            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+            oai.send(JSON.stringify({
+              type: "response.create",
+              response: { modalities: ["audio","text"] }
+            }));
+          } catch (err) {
+            console.error("Commit/send error:", err);
+          }
+        }, DEBOUNCE_MS);
       }
-      return;
     }
+    return;
+  }
+
 
     if (msg.event === "stop") {
       if (oai && oaiReady) {
