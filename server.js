@@ -131,6 +131,7 @@ async function handleTwilio(ws, req) {
   let awaitingSummary = false;
   let summaryText = "";
   let summaryTimeout = null;
+  let keepalive = null;          // <— make keepalive visible to both places
 
   // OpenAI socket + state (created lazily after "start" if not echo)
   let oai = null;
@@ -191,7 +192,7 @@ async function handleTwilio(ws, req) {
       try {
         const msg = JSON.parse(data.toString());
         const t = msg.type || "(no type)";
-    
+
         // 1) Audio streaming from OpenAI -> Twilio (unchanged)
         if ((t === "response.audio.delta" || t === "response.output_audio.delta") && msg.delta && streamSid) {
           ws.send(JSON.stringify({
@@ -201,39 +202,32 @@ async function handleTwilio(ws, req) {
           }));
         }
 
+        // 2) Text deltas (summary chunks)
         if (awaitingSummary && t === "response.output_text.delta" && msg.delta) {
           console.log("Summary token:", msg.delta);
           summaryText += msg.delta;
         }
-        
-        // 2) Text deltas (summary chunks)
-        if (awaitingSummary && t === "response.output_text.delta" && msg.delta) {
-          summaryText += msg.delta;
-        }
-    
+
         // 3) Summary completion: send to GroupMe, then clean up the sockets
         if (awaitingSummary && t === "response.completed") {
           console.log("Summary complete:", summaryText);
           awaitingSummary = false;
           if (summaryTimeout) { clearTimeout(summaryTimeout); summaryTimeout = null; }
+          if (keepalive) { clearInterval(keepalive); keepalive = null; }   // <— fix: clear keepalive here
+
           const text = summaryText.trim();
           summaryText = "";
           if (text) {
-            try {
-              await sendGroupMe(`📝 Call summary: ${text}`);
-            } catch (e) {
-              console.error("Failed to send summary to GroupMe:", e);
-            }
+            try { await sendGroupMe(`📝 Call summary: ${text}`); }
+            catch (e) { console.error("Failed to send summary to GroupMe:", e); }
           } else {
-            try {
-              await sendGroupMe("📝 Call summary unavailable.");
-            } catch {}
+            try { await sendGroupMe("📝 Call summary unavailable."); } catch {}
           }
           // after we’ve posted the summary, close sockets
           try { oai.close(); } catch {}
           try { ws.close(); } catch {}
         }
-    
+
       } catch (err) {
         console.error("Error relaying OpenAI message:", err);
       }
@@ -373,6 +367,22 @@ async function handleTwilio(ws, req) {
               instructions: "Summarize the phone conversation that just ended in 2–3 complete sentences. Include who spoke and what was said. Respond immediately."
             }
           }));
+
+          // --- Keepalive pings so the socket stays open until summary arrives ---
+          let keepaliveCount = 0;
+          keepalive = setInterval(() => {
+            if (awaitingSummary && oai && oai.readyState === WebSocket.OPEN) {
+              try {
+                oai.ping?.();
+                keepaliveCount++;
+                console.log(`Keeping socket alive... (${keepaliveCount})`);
+              } catch (err) {
+                console.error("Keepalive ping failed:", err);
+              }
+            } else {
+              if (keepalive) { clearInterval(keepalive); keepalive = null; }
+            }
+          }, 3000); // every 3 seconds
 
           // IMPORTANT: stop here so we don't close sockets before we get the summary.
           return;
