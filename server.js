@@ -164,20 +164,22 @@ async function handleTwilio(ws, req) {
         session: {
           voice,
           modalities: ["audio", "text"],
-          input_audio_format: "g711_ulaw",   // Twilio -> server (keep)
-          output_audio_format: "pcm16",      // OpenAI -> server (we’ll convert)
-          sample_rate: 16000,                // pinned to 16kHs so the converter always works
+          input_audio_format: "g711_ulaw",     // Twilio -> server
+          output_audio_format: "pcm16",        // OpenAI -> server (we convert)
+          sample_rate: 16000,                  // pin to 16k so our converter is correct
           turn_detection: { type: "server_vad" },
-          instructions: system
+          // Sheet system prompt + hard English pin
+          instructions: `${system}\n\nRules:\n- Speak ONLY in clear American English.\n- Never switch languages.\n- Keep responses concise and natural.`
         }
       }));
+
 
       // Opening turn built from sheet template (includes your ${PROMPT})
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: opening
+          instructions: `${opening}\n(Respond in American English only.)`
         }
       }));
     });
@@ -276,8 +278,12 @@ async function handleTwilio(ws, req) {
             oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
             oai.send(JSON.stringify({
               type: "response.create",
-              response: { modalities: ["audio","text"] }
+              response: {
+                modalities: ["audio","text"],
+                instructions: "Respond in clear American English only."
+              }
             }));
+
           } catch (err) {
             console.error("Commit/send error:", err);
           }
