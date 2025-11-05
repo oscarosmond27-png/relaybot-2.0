@@ -175,7 +175,7 @@ async function handleTwilio(ws, req) {
           type: "response.create",
           response: {
             modalities: ["audio", "text"],
-            instructions: `Say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says ". Then say: "${prompt}". Then you may follow up with something related to the message you are carrying, which is "${prompt}". Keep in mind that you are speaking to whoever the message was meant for, not the sender of the message.`,
+            instructions: `Say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says ". Then say: "${prompt}". Then you may follow up with something related to the message you are carrying, which is "${prompt}". Keep in mind that you are speaking to whoever the message was meant for, not the sender of the message. Always ask if they would like to reply to Oscar or ask some other follow up question.`,
           },
         })
       );
