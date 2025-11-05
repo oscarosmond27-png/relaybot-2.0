@@ -166,7 +166,7 @@ async function handleTwilio(ws, req) {
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",   // Twilio -> server (keep)
           output_audio_format: "pcm16",      // OpenAI -> server (we’ll convert)
-          // no sample_rate here; OpenAI defaults to 16k for PCM
+          sample_rate: 16000,                // pinned to 16kHs so the converter always works
           turn_detection: { type: "server_vad" },
           instructions: system
         }
