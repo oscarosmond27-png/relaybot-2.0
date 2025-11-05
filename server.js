@@ -127,6 +127,11 @@ async function handleTwilio(ws, req) {
   let streamSid = null;
   let started = false;
 
+  // summary capture state
+  let awaitingSummary = false;
+  let summaryText = "";
+
+
   // OpenAI socket + state (created lazily after "start" if not echo)
   let oai = null;
   let oaiReady = false;
@@ -181,26 +186,48 @@ async function handleTwilio(ws, req) {
       );
     });
 
-    // OpenAI -> Twilio (μ-law @ 8k). Forward deltas directly.
-    oai.on("message", (data) => {
+    // Handle both audio (for the call) and text (for the end-of-call summary)
+    oai.on("message", async (data) => {
       try {
         const msg = JSON.parse(data.toString());
         const t = msg.type || "(no type)";
-        const isDelta =
-          t === "response.audio.delta" || t === "response.output_audio.delta";
-        if (isDelta && msg.delta && streamSid) {
-          ws.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: msg.delta },
-            })
-          );
+    
+        // 1) Audio streaming from OpenAI -> Twilio (unchanged)
+        if ((t === "response.audio.delta" || t === "response.output_audio.delta") && msg.delta && streamSid) {
+          ws.send(JSON.stringify({
+            event: "media",
+            streamSid,
+            media: { payload: msg.delta }
+          }));
         }
+    
+        // 2) Text deltas (we only care when we're awaiting the summary)
+        if (awaitingSummary && t === "response.output_text.delta" && msg.delta) {
+          summaryText += msg.delta;
+        }
+    
+        // 3) Summary completion: send to GroupMe, then clean up the sockets
+        if (awaitingSummary && t === "response.completed") {
+          awaitingSummary = false;
+          const text = summaryText.trim();
+          summaryText = "";
+          if (text) {
+            try {
+              await sendGroupMe(`📝 Call summary: ${text}`);
+            } catch (e) {
+              console.error("Failed to send summary to GroupMe:", e);
+            }
+          }
+          // after we’ve posted the summary, close sockets
+          try { oai.close(); } catch {}
+          try { ws.close(); } catch {}
+        }
+    
       } catch (err) {
-        console.error("Error relaying OpenAI audio:", err);
+        console.error("Error relaying OpenAI message:", err);
       }
     });
+
 
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
     oai.on("close", () => {
@@ -304,6 +331,25 @@ async function handleTwilio(ws, req) {
     }
 
     if (msg.event === "stop") {
+      if (oai && oaiReady) {
+        try {
+          // Ask the same realtime session for a short text summary of the call.
+          awaitingSummary = true;
+          summaryText = "";
+          oai.send(JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["text"],
+              instructions: "Summarize the conversation that just occurred in 2–3 concise sentences."
+            }
+          }));
+          // IMPORTANT: stop here so we don't close sockets before we get the summary.
+          return;
+        } catch (err) {
+          console.error("Error requesting summary:", err);
+          // fall through to existing close logic if something goes wrong
+        }
+      }
       if (oai && oaiReady) {
         try {
           oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
