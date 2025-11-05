@@ -166,7 +166,7 @@ async function handleTwilio(ws, req) {
             output_audio_format: "g711_ulaw", // match Twilio exactly
             turn_detection: { type: "server_vad" },
             instructions:
-              "You are a friendly phone agent. Speak ONLY in clear American English. Never switch languages. Be concise and natural.",
+              "You are a friendly phone agent. Speak ONLY in clear American English. Never switch languages, unless you are spoken to in another language. Be concise and natural. Keep the phone call under 2 minutes.",
           },
         })
       );
@@ -175,7 +175,7 @@ async function handleTwilio(ws, req) {
           type: "response.create",
           response: {
             modalities: ["audio", "text"],
-            instructions: `Say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says ". Then say: "${prompt}". Then you may follow up with something related to the message you are carrying, which is "${prompt}".`,
+            instructions: `Say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says ". Then say: "${prompt}". Then you may follow up with something related to the message you are carrying, which is "${prompt}". Keep in mind that you are speaking to whoever the message was meant for, not the sender of the message.`,
           },
         })
       );
