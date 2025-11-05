@@ -160,7 +160,7 @@ async function handleTwilio(ws, req) {
         JSON.stringify({
           type: "session.update",
           session: {
-            voice: "alloy",
+            voice: "echo",
             modalities: ["audio", "text"], // must include both
             input_audio_format: "g711_ulaw", // Twilio -> us
             output_audio_format: "g711_ulaw", // match Twilio exactly
@@ -175,7 +175,7 @@ async function handleTwilio(ws, req) {
           type: "response.create",
           response: {
             modalities: ["audio", "text"],
-            instructions: `Say exactly: "${prompt}". Then ask: "Anything else?"`,
+            instructions: `Say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says ". Then say: "${prompt}"`,
           },
         })
       );
