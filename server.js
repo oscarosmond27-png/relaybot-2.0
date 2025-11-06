@@ -325,14 +325,21 @@ function mulawToWavPcm16Mono8k(muBuf) {
   return Buffer.concat([wavHeader, pcm]);
 }
 
-function mulawDecodeSample(mu) {
-  mu = ~mu & 0xff;
-  const sign = mu & 0x80;
-  let exponent = (mu >> 4) & 0x07;
-  let mantissa = mu & 0x0f;
-  let sample = ((mantissa << 4) + 0x08) << (exponent + 3);
-  sample -= 0x84;
-  if (sign) sample = -sample;
+function mulawDecodeSample(u) {
+  // Standard G.711 μ-law decode (16-bit PCM)
+  u = (~u) & 0xFF;
+
+  // Build magnitude
+  let t = ((u & 0x0F) << 3) + 0x84;          // 0x84 is the bias (132)
+  t <<= ((u & 0x70) >> 4);                   // exponent shift
+
+  // Apply sign and final bias
+  let sample = (u & 0x80) ? (0x84 - t) : (t - 0x84);
+
+  // Defensive clamp to int16 (prevents Buffer.writeInt16LE range errors)
+  if (sample > 32767) sample = 32767;
+  if (sample < -32768) sample = -32768;
+
   return sample;
 }
 
