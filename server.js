@@ -335,9 +335,11 @@ ${labeled}`);
 
       // Optional compact summary (2–3 sentences) using total text
       try {
-        const base = filledTurns.map((t) => `${t.role === 'assistant' ? 'Assistant' : 'Caller'}: ${t.text || ''}`)
-                                .join('
-').trim();
+        const base = filledTurns
+          .map((t) => `${t.role === 'assistant' ? 'Assistant' : 'Caller'}: ${t.text || ''}`)
+          .join('
+')
+          .trim();
         if (base.length > 30) {
           const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
