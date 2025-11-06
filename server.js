@@ -161,7 +161,7 @@ async function handleTwilio(ws, req) {
       if (isAudio && msg.delta && streamSid) {
         if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
       }
-      if (t === "response.created") openAssistantTurn();
+      if (t === "response.created") { closeAssistantTurn(); openAssistantTurn(); }
       if ((t === "response.audio_transcript.delta" || t === "response.output_text.delta") && msg.delta) {
         assistantTranscript += msg.delta;
         if (assistantTurnOpen) currentAssistantText += msg.delta;
@@ -188,13 +188,24 @@ async function handleTwilio(ws, req) {
         hasBufferedAudio = true;
         if (commitTimer) clearTimeout(commitTimer);
         commitTimer = setTimeout(() => {
-          if (hasBufferedAudio) {
-            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-            hasBufferedAudio = false;
+          try {
+            if (hasBufferedAudio) {
+              oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+              hasBufferedAudio = false;
+            }
+            // Close any assistant turn that just finished speaking
+            closeAssistantTurn();
+            // Record a caller turn placeholder at this boundary
+            turns.push({ role: "caller" });
+            callerTurns.push({});
+            // Ask assistant to respond (a new assistant turn will open on response.created)
+            oai.send(JSON.stringify({
+              type: "response.create",
+              response: { modalities: ["audio", "text"] },
+            }));
+          } catch (err) {
+            console.error("Commit/send error:", err);
           }
-          turns.push({ role: "caller" });
-          callerTurns.push({});
-          oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio", "text"] } }));
         }, DEBOUNCE_MS);
       }
       ulawChunks.push(Buffer.from(msg.media.payload, "base64"));
@@ -202,6 +213,8 @@ async function handleTwilio(ws, req) {
     }
 
     if (msg.event === "stop") {
+      // ensure any in-progress assistant turn is flushed
+      closeAssistantTurn();
       try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
       const ulaw = Buffer.concat(ulawChunks);
       let callerTranscript = "";
@@ -218,16 +231,21 @@ async function handleTwilio(ws, req) {
           body: fd,
         });
         const tj = await tr.json();
-        callerTranscript = tj.text || "";
+        callerTranscript = (tj.text || "").trim();
       }
 
       const filledTurns = interleaveCallerText(turns, callerTranscript, callerTurns.length);
       const labeled = filledTurns
-        .map((t) => (t.role === "assistant" ? `Assistant: ${t.text}` : `Caller: ${t.text}`))
+        .map((t) => {
+          const line = (t.role === "assistant" ? `Assistant: ${t.text || ""}` : `Caller: ${t.text || ""}`).trim();
+          return line.length ? line : null;
+        })
         .filter(Boolean)
-        .join('\n');
+        .join('
+');
 
-      await sendGroupMe(`🗣️ Transcript\n${labeled}`);
+      await sendGroupMe(`🗣️ Transcript
+${labeled}`);
 
       const base = filledTurns
         .map((t) => `${t.role === 'assistant' ? 'Assistant' : 'Caller'}: ${t.text || ''}`)
