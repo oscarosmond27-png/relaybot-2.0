@@ -1,6 +1,6 @@
-// server.js — GroupMe + Twilio + OpenAI voice (cleaned and simplified)
+// server.js — GroupMe + Twilio + OpenAI voice with speaker-labeled transcripts
 import express from "express";
-import fetch from "node-fetch";
+import fetch, { FormData, Blob } from "node-fetch";
 import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
@@ -108,9 +108,12 @@ async function handleTwilio(ws, req) {
   let streamSid = null;
   let started = false;
 
-  let transcriptText = ""; // collect everything said
-  let hasBufferedAudio = false;
+  // Speaker-labeled capture
+  let assistantTranscript = "";           // assistant words (from OpenAI realtime)
+  let ulawChunks = [];                    // caller audio frames (μ-law base64 -> Buffer)
 
+  // Realtime plumbing
+  let hasBufferedAudio = false;
   let oai = null;
   let oaiReady = false;
   let commitTimer = null;
@@ -141,14 +144,14 @@ async function handleTwilio(ws, req) {
           output_audio_format: "g711_ulaw",
           turn_detection: { type: "server_vad" },
           instructions:
-            "You are a friendly but concise phone agent. Speak in clear American English. Keep calls under 2 minutes.",
+            "You are a friendly but concise phone agent. Keep responses short, natural, and never mention AI or internal tools.",
         },
       }));
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Start the call by saying: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: " Then clearly deliver this message: "${prompt}". Speak warmly but professionally, like a real assistant making a quick call. After finishing, pause to allow the person to respond. Remember that you are not an AI, you are a person who I have hired to make calls. DO NOT REVEAL THAT YOU ARE AN AI`,
+          instructions: `Start with: "Hello! I am Oscar's personal call assistant. Oscar has a message for you." Then clearly deliver this message: "${prompt}". Pause and listen. Keep the rest of the conversation brief, natural, and helpful. Do not mention AI or system details.`,
         },
       }));
     });
@@ -169,9 +172,9 @@ async function handleTwilio(ws, req) {
         }
       }
 
-      // Capture transcript deltas (spoken text)
+      // Capture assistant transcript deltas (spoken text)
       if (t === "response.audio_transcript.delta" && msg.delta) {
-        transcriptText += msg.delta;
+        assistantTranscript += msg.delta;
       }
     });
 
@@ -197,6 +200,7 @@ async function handleTwilio(ws, req) {
     }
 
     if (msg.event === "media" && streamSid) {
+      // Forward caller audio to OpenAI realtime
       if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
         oai.send(JSON.stringify({
           type: "input_audio_buffer.append",
@@ -220,58 +224,93 @@ async function handleTwilio(ws, req) {
           }
         }, DEBOUNCE_MS);
       }
+
+      // Buffer μ-law frame for Whisper
+      try {
+        ulawChunks.push(Buffer.from(msg.media.payload, "base64"));
+      } catch (e) {
+        console.error("Failed to buffer μ-law chunk:", e);
+      }
       return;
     }
 
     if (msg.event === "stop") {
-      console.log("Call stopped. Summarizing via GPT-4o-mini…");
+      console.log("Call stopped. Building WAV & transcribing with Whisper…");
 
-      if (oai && oai.readyState === WebSocket.OPEN) {
-        try { oai.close(); } catch {}
-      }
+      // Close realtime socket
+      try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
+
+      // Build a single μ-law Buffer and transcribe
+      const ulaw = Buffer.concat(ulawChunks);
+      let callerTranscript = "";
 
       try {
-        const transcript = transcriptText.trim();
-        if (transcript.length < 30) {
-          await sendGroupMe("📝 Call summary: No usable transcript captured.");
-          try { ws.close(); } catch {}
-          return;
-        }
-
-        const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content:
-                  "You are a neutral assistant that summarizes phone calls in plain English.",
-              },
-              {
-                role: "user",
-                content:
-                  `Here is the transcript of a phone call:\n\n${transcript}\n\nSummarize what was said in 2–3 sentences. Be factual and concise.`,
-              },
-            ],
-          }),
-        });
-
-        const data = await summaryResponse.json();
-        const summary = data.choices?.[0]?.message?.content?.trim();
-
-        if (summary) {
-          await sendGroupMe(`📝 Call summary: ${summary}`);
+        if (ulaw.length === 0) {
+          console.warn("No μ-law audio captured.");
         } else {
-          await sendGroupMe("📝 Call summary unavailable.");
+          // Convert μ-law -> PCM16 -> WAV (8kHz)
+          const pcm16 = ulawToPcm16(ulaw);
+          const wav = pcm16ToWav(pcm16, 8000);
+
+          // Transcribe with Whisper
+          const fd = new FormData();
+          fd.append("model", "whisper-1");
+          fd.append("file", new Blob([wav], { type: "audio/wav" }), "call.wav");
+
+          const tr = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+            method: "POST",
+            headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+            body: fd,
+          });
+
+          const tj = await tr.json();
+          callerTranscript = String(tj?.text || "").trim();
         }
       } catch (err) {
-        console.error("Error generating summary:", err);
-        await sendGroupMe("📝 Call summary failed due to error.");
+        console.error("Whisper transcription error:", err);
+      }
+
+      // Combine into speaker-labeled transcript
+      const labeled =
+        (assistantTranscript ? `Assistant: ${assistantTranscript.trim()}\n` : "") +
+        (callerTranscript ?   `Caller: ${callerTranscript.trim()}`           : "");
+
+      // Post to GroupMe (full transcript + optional summary)
+      try {
+        if (labeled) {
+          await sendGroupMe(`🗣️ Transcript\n${labeled}`);
+        } else {
+          await sendGroupMe("🗣️ Transcript unavailable.");
+        }
+      } catch (e) {
+        console.error("GroupMe post error:", e);
+      }
+
+      // Optional compact summary (2–3 sentences)
+      try {
+        const base = (assistantTranscript + "\n" + callerTranscript).trim();
+        if (base.length > 30) {
+          const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              model: "gpt-4o-mini",
+              messages: [
+                { role: "system", content: "You summarize phone calls in 2–3 crisp sentences." },
+                { role: "user", content: base },
+              ],
+              max_tokens: 160,
+            }),
+          });
+          const data = await summaryResponse.json();
+          const summary = data.choices?.[0]?.message?.content?.trim();
+          if (summary) await sendGroupMe(`📝 Summary: ${summary}`);
+        }
+      } catch (err) {
+        console.error("Summary error:", err);
       }
 
       try { ws.close(); } catch {}
@@ -333,3 +372,56 @@ async function sendGroupMe(text) {
   });
 }
 
+// === Audio conversion helpers: μ-law -> PCM16 -> WAV (8kHz mono) ===
+function ulawByteToLinearSample(uVal) {
+  // ITU-T G.711 μ-law decode
+  const MULAW_BIAS = 0x84; // 132
+  uVal = ~uVal & 0xff;
+  const sign = uVal & 0x80;
+  const exponent = (uVal & 0x70) >> 4;
+  const mantissa = uVal & 0x0f;
+  let sample = ((mantissa << 4) + 0x08) << (exponent + 3);
+  sample -= MULAW_BIAS;
+  if (sign) sample = -sample;
+  if (sample > 32767) sample = 32767;
+  if (sample < -32768) sample = -32768;
+  return sample;
+}
+
+function ulawToPcm16(ulawBuf) {
+  const out = new Int16Array(ulawBuf.length);
+  for (let i = 0; i < ulawBuf.length; i++) out[i] = ulawByteToLinearSample(ulawBuf[i]);
+  return out;
+}
+
+function pcm16ToWav(pcm16, sampleRate = 8000) {
+  const numChannels = 1;
+  const bytesPerSample = 2;
+  const byteRate = sampleRate * numChannels * bytesPerSample;
+  const blockAlign = numChannels * bytesPerSample;
+  const dataSize = pcm16.length * bytesPerSample;
+  const buffer = Buffer.alloc(44 + dataSize);
+
+  // RIFF header
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + dataSize, 4);
+  buffer.write("WAVE", 8);
+
+  // fmt chunk
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16);              // PCM chunk size
+  buffer.writeUInt16LE(1, 20);               // PCM format
+  buffer.writeUInt16LE(numChannels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(byteRate, 28);
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(16, 34);              // bits per sample
+
+  // data chunk
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(dataSize, 40);
+
+  // samples
+  for (let i = 0; i < pcm16.length; i++) buffer.writeInt16LE(pcm16[i], 44 + i * 2);
+  return buffer;
+}
