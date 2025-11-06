@@ -73,18 +73,14 @@ app.get("/twiml", (req, res) => {
     loopFlag = true;
   }
 
-  // Use a clean URL and pass values via <Parameter>
   let wsUrl = `wss://${host}/twilio`;
 
   // Escape prompt for XML attribute
-  const promptAttr = String(prompt)
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;");
+  const promptAttr = String(prompt).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 
   const xml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
-    //`<Say>Hello, I have a quick message for you.</Say>` +
     `<Connect>` +
     `  <Stream url="${wsUrl}">` +
     `    <Parameter name="prompt" value="${promptAttr}"/>` +
@@ -108,9 +104,7 @@ server.on("upgrade", (req, socket, head) => {
       console.log("WS upgraded to /twilio");
       handleTwilio(ws, req).catch((err) => {
         console.error("handleTwilio error:", err);
-        try {
-          ws.close();
-        } catch {}
+        try { ws.close(); } catch {}
       });
     });
   } else {
@@ -129,10 +123,15 @@ async function handleTwilio(ws, req) {
 
   // --- summary capture state ---
   let awaitingSummary = false;
+  let pendingSummaryRequest = false; // wait to send until idle
+  let summaryRequested = false;
   let summaryText = "";
   let summaryTimeout = null;
   let transcriptText = "";   // collect audio transcript tokens here (fallback)
   let keepalive = null;      // interval handle so we can clear it from anywhere
+
+  // audio buffering tracker to avoid empty commits
+  let hasBufferedAudio = false;
 
   // OpenAI socket + state (created lazily after "start" if not echo)
   let oai = null;
@@ -156,36 +155,30 @@ async function handleTwilio(ws, req) {
 
     // Keepalive pings to avoid idle disconnects
     const pingIv = setInterval(() => {
-      try {
-        oai.ping?.();
-      } catch {}
+      try { oai.ping?.(); } catch {}
     }, 15000);
 
     oai.on("open", () => {
       oaiReady = true;
-      oai.send(
-        JSON.stringify({
-          type: "session.update",
-          session: {
-            voice: "coral",
-            modalities: ["audio", "text"], // must include both
-            input_audio_format: "g711_ulaw", // Twilio -> us
-            output_audio_format: "g711_ulaw", // match Twilio exactly
-            turn_detection: { type: "server_vad" },
-            instructions:
-              "You are a friendly phone agent. Speak ONLY in clear American English. Never switch languages, unless you are spoken to in another language. Be concise and natural. Keep the phone call under 2 minutes.",
-          },
-        })
-      );
-      oai.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            instructions: `Say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says ". Then say: "${prompt}". Then you may follow up with something related to the message you are carrying, which is "${prompt}". Keep in mind that you are speaking to whoever the message was meant for, not the sender of the message. Always ask if they would like to reply to Oscar or ask some other follow up question.`,
-          },
-        })
-      );
+      oai.send(JSON.stringify({
+        type: "session.update",
+        session: {
+          voice: "coral",
+          modalities: ["audio", "text"],
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          turn_detection: { type: "server_vad" },
+          instructions:
+            "You are a friendly phone agent. Speak ONLY in clear American English. Never switch languages unless the other party does. Be concise and natural. Keep the phone call under 2 minutes.",
+        },
+      }));
+      oai.send(JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions: `Say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says ". Then say: "${prompt}". Then you may follow up briefly, keeping context to "${prompt}". Ask if they'd like to reply to Oscar.`,
+        },
+      }));
     });
 
     // Handle both audio (for the call) and text (for the end-of-call summary)
@@ -197,23 +190,21 @@ async function handleTwilio(ws, req) {
           console.error("OpenAI non-JSON frame:", raw.slice(0, 120));
           return;
         }
-    
+
         const t = msg.type || "(no type)";
 
         if (t === "error") {
           console.error("OpenAI error:", msg);
           // Don't return; sometimes the stream continues after a soft error
         }
-            
-        // extra visibility while we wait for the summary
-        if (awaitingSummary) {
-          console.log("OAI event during summary:", t);
-        }
-    
-        // 1) Audio streaming from OpenAI -> Twilio (unchanged)
-        const isAudioDelta = (t === "response.audio.delta" || t === "response.output_audio.delta");
+
+        // visibility while awaiting summary
+        if (awaitingSummary) console.log("OAI event during summary:", t);
+
+        // 1) Audio streaming from OpenAI -> Twilio (unchanged, guarded)
+        const isAudioDelta =
+          (t === "response.audio.delta" || t === "response.output_audio.delta");
         if (isAudioDelta && msg.delta && streamSid) {
-          // Only forward if Twilio's WebSocket is still open
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               event: "media",
@@ -225,66 +216,77 @@ async function handleTwilio(ws, req) {
           }
         }
 
-    
-        // 2) Audio transcript deltas (your logs showed these coming in)
+        // 2) Audio transcript deltas (logs showed these)
         if (awaitingSummary && t === "response.audio_transcript.delta" && msg.delta) {
           console.log("Transcript token:", msg.delta);
           transcriptText += msg.delta;
         }
-    
+
         // 3) Text deltas (if the model sends actual text tokens, capture them)
-        const isTextDelta = (t === "response.output_text.delta" || t === "response.text.delta");
+        const isTextDelta =
+          (t === "response.output_text.delta" || t === "response.text.delta");
         if (awaitingSummary && isTextDelta && msg.delta) {
           console.log("Summary token:", msg.delta);
           summaryText += msg.delta;
         }
-    
+
         // 4) Defensive: sometimes a single blob lands without .delta
         if (awaitingSummary && (t === "response.output_text" || t === "response.text")) {
           const txt = (msg.text || msg.output_text || "").trim();
           if (txt) summaryText += txt;
         }
-    
-        // 5) Completion (several variants exist)
+
+        // 5) Idle detection to start summary request
         const isDone = (t === "response.completed" || t === "response.complete" || t === "response.done");
-        if (awaitingSummary && isDone) {
+        if (isDone && awaitingSummary && pendingSummaryRequest && !summaryRequested) {
+          // Now safe to ask for the summary
+          summaryRequested = true;
+          oai.send(JSON.stringify({
+            type: "response.create",
+            response: {
+              modalities: ["text"],
+              instructions: "Write a neutral, factual summary of the phone conversation in 1–2 sentences, mentioning who spoke and the key point. If there is not enough information to summarize, respond exactly: No conversation captured. Do not apologize or refuse.",
+            }
+          }));
+          console.log("Summary request sent (after idle).");
+        }
+
+        // 6) Completion (finish summary)
+        if (awaitingSummary && isDone && summaryRequested) {
           awaitingSummary = false;
+          pendingSummaryRequest = false;
+          summaryRequested = false;
+
           if (summaryTimeout) { clearTimeout(summaryTimeout); summaryTimeout = null; }
           if (keepalive) { clearInterval(keepalive); keepalive = null; }
-    
-          // prefer explicit summaryText; if empty, use transcript fallback
+
           let finalText = (summaryText || "").trim();
           if (!finalText && transcriptText.trim()) {
             finalText = transcriptText.trim();
             console.log("Using transcript fallback for summary.");
           }
-          // clear buffers
           summaryText = "";
           transcriptText = "";
-    
+
           if (finalText) {
             try { await sendGroupMe(`📝 Call summary: ${finalText}`); }
             catch (e) { console.error("Failed to send summary to GroupMe:", e); }
           } else {
             try { await sendGroupMe("📝 Call summary unavailable."); } catch {}
           }
-          // close sockets
           try { oai.close(); } catch {}
           try { ws.close(); } catch {}
           return;
         }
-    
+
       } catch (err) {
         console.error("Error relaying OpenAI message:", err);
       }
     });
 
-
-
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
     oai.on("close", () => {
       clearInterval(pingIv);
-      // Only force-close Twilio if we're NOT waiting on a summary
       if (!awaitingSummary) {
         try { ws.close(); } catch {}
       }
@@ -296,36 +298,33 @@ async function handleTwilio(ws, req) {
   // Single message handler to process connected -> start -> media -> stop
   ws.on("message", async (buf) => {
     let msg;
-    try {
-      msg = JSON.parse(buf.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-    if (msg.event === "connected") {
-      // First event from Twilio Media Streams. Nothing to do yet.
-      return;
-    }
+    if (msg.event === "connected") return;
 
     if (msg.event === "start" && !started) {
       started = true;
+
       // fresh buffers per call
       awaitingSummary = false;
+      pendingSummaryRequest = false;
+      summaryRequested = false;
       summaryText = "";
       transcriptText = "";
+      hasBufferedAudio = false;
       if (summaryTimeout) { clearTimeout(summaryTimeout); summaryTimeout = null; }
       if (keepalive) { clearInterval(keepalive); keepalive = null; }
+
       streamSid = msg.start?.streamSid || null;
       const cp = msg.start?.customParameters || {};
-      if (typeof cp.prompt === "string" && cp.prompt.trim())
-        prompt = cp.prompt.trim();
+      if (typeof cp.prompt === "string" && cp.prompt.trim()) prompt = cp.prompt.trim();
       echoMode = cp.loop === "1";
 
       console.log("Start received. prompt:", prompt, "echoMode:", echoMode);
 
       if (echoMode) {
         console.log("Loopback mode enabled");
-        return; // stay in handler; we'll echo 'media' below
+        return;
       } else {
         ensureOpenAI();
         return;
@@ -334,36 +333,34 @@ async function handleTwilio(ws, req) {
 
     if (msg.event === "media" && streamSid) {
       if (echoMode) {
-        // Bounce caller audio back unchanged
-        ws.send(
-          JSON.stringify({
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
             event: "media",
             streamSid,
             media: { payload: msg.media.payload },
-          })
-        );
+          }));
+        }
       } else {
-        // Forward to OpenAI and auto-commit after brief silence
         if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
           // Append this audio chunk
-          oai.send(
-            JSON.stringify({
-              type: "input_audio_buffer.append",
-              audio: msg.media.payload,
-            })
-          );
+          oai.send(JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: msg.media.payload,
+          }));
+          hasBufferedAudio = true;
 
           // Debounce: when caller pauses, commit and ask for a reply
           if (commitTimer) clearTimeout(commitTimer);
           commitTimer = setTimeout(() => {
             try {
-              oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-              oai.send(
-                JSON.stringify({
-                  type: "response.create",
-                  response: { modalities: ["audio", "text"] },
-                })
-              );
+              if (hasBufferedAudio) {
+                oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+                hasBufferedAudio = false;
+              }
+              oai.send(JSON.stringify({
+                type: "response.create",
+                response: { modalities: ["audio","text"] }
+              }));
             } catch (err) {
               console.error("Commit/send error:", err);
             }
@@ -373,16 +370,16 @@ async function handleTwilio(ws, req) {
       return;
     }
 
-    // Optional: respond immediately when Twilio sends a 'mark'
     if (msg.event === "mark" && oai && oaiReady) {
       try {
-        oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        oai.send(
-          JSON.stringify({
-            type: "response.create",
-            response: { modalities: ["audio", "text"] },
-          })
-        );
+        if (hasBufferedAudio) {
+          oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+          hasBufferedAudio = false;
+        }
+        oai.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio","text"] }
+        }));
       } catch (e) {
         console.error("mark commit error", e);
       }
@@ -392,40 +389,39 @@ async function handleTwilio(ws, req) {
     if (msg.event === "stop") {
       if (oai && oaiReady) {
         try {
-          // Finalize any buffered input before summary
-          oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-    
+          // Finalize any buffered input before summary (only if we actually have some)
+          if (hasBufferedAudio) {
+            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+            hasBufferedAudio = false;
+          }
+
           // Cancel any in-flight audio so the model focuses on a text reply
           oai.send(JSON.stringify({ type: "response.cancel" }));
-    
+
           // Small settle delay
           await new Promise(r => setTimeout(r, 600));
-    
-          console.log("Requesting summary from OpenAI...");
-    
-          // Ask the same realtime session for a short text summary of the call.
+
+          console.log("Requesting summary from OpenAI (will wait for idle)...");
+
+          // Prepare to request summary once idle
           awaitingSummary = true;
+          pendingSummaryRequest = true;
+          summaryRequested = false;
           summaryText = "";
-          transcriptText = ""; // reset transcript buffer too
-    
-          // Safety timeout in case the summary never arrives
+          transcriptText = "";
+
+          // Safety timeout in case the summary never arrives or idle never detected
           summaryTimeout = setTimeout(async () => {
             if (awaitingSummary) {
               awaitingSummary = false;
+              pendingSummaryRequest = false;
+              summaryRequested = false;
               try { await sendGroupMe("📝 Call summary unavailable (timeout)."); } catch {}
               try { oai.close(); } catch {}
               try { ws.close(); } catch {}
             }
           }, 40000);
-    
-          oai.send(JSON.stringify({
-            type: "response.create",
-            response: {
-              modalities: ["text"],
-              instructions: "Summarize the phone conversation that just ended in 2–3 complete sentences. Include who spoke and what was said. Respond immediately."
-            }
-          }));
-    
+
           // --- Keepalive pings so the socket stays open until summary arrives ---
           let keepaliveCount = 0;
           keepalive = setInterval(() => {
@@ -441,32 +437,45 @@ async function handleTwilio(ws, req) {
               if (keepalive) { clearInterval(keepalive); keepalive = null; }
             }
           }, 3000); // every 3 seconds
-    
-          // IMPORTANT: stop here so we don't close sockets before we get the summary.
-          return;
+
+          // Fallback: if for some reason we never get a done event,
+          // try issuing the summary after 1500ms anyway.
+          setTimeout(() => {
+            if (awaitingSummary && pendingSummaryRequest && !summaryRequested && oai && oai.readyState === WebSocket.OPEN) {
+              summaryRequested = true;
+              oai.send(JSON.stringify({
+                type: "response.create",
+                response: {
+                  modalities: ["text"],
+                  instructions: "Write a neutral, factual summary of the phone conversation in 1–2 sentences, mentioning who spoke and the key point. If there is not enough information to summarize, respond exactly: No conversation captured. Do not apologize or refuse.",
+                }
+              }));
+              console.log("Summary request sent (fallback).");
+            }
+          }, 1500);
+
+          return; // don't close sockets yet
         } catch (err) {
           console.error("Error requesting summary:", err);
-          // fall through to existing close logic if something goes wrong
+          // fall through to close logic if something goes wrong
         }
       }
       if (oai && oaiReady) {
-        try {
-          oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        } catch {}
-        try {
-          oai.close();
-        } catch {}
+        try { oai.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
+        try { oai.close(); } catch {}
       }
-      try {
-        ws.close();
-      } catch {}
+      try { ws.close(); } catch {}
       return;
     }
-
   });
 
   // Don't kill OpenAI while we're waiting on the summary
   ws.on("close", () => {
+    // Clean up timers on WS close
+    try {
+      if (summaryTimeout) { clearTimeout(summaryTimeout); summaryTimeout = null; }
+      if (keepalive) { clearInterval(keepalive); keepalive = null; }
+    } catch {}
     try {
       if (oai && !awaitingSummary) oai.close();
     } catch {}
@@ -493,13 +502,10 @@ async function makeTwilioCallWithTwiml(to, promptText) {
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;");
 
-  const streamUrl = `wss://${
-    process.env.BASE_HOST || "relaybot-2-0.onrender.com"
-  }/twilio`;
+  const streamUrl = `wss://${process.env.BASE_HOST || "relaybot-2-0.onrender.com"}/twilio`;
 
   const twiml =
     `<?xml version="1.0" encoding="UTF-8"?><Response>` +
-    //`<Say>Hello, I have a quick message for you.</Say>` +
     `<Connect><Stream url="${streamUrl}">` +
     `<Parameter name="prompt" value="${safePrompt}"/>` +
     `<Parameter name="loop" value="0"/>` +
