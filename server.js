@@ -318,12 +318,14 @@ async function handleTwilio(ws, req) {
           ? (t.text ? `Assistant: ${t.text}` : null)
           : (t.text ? `Caller: ${t.text}` : null))
         .filter(Boolean)
-        .join("\n");
+        .join("
+");
 
       // Post to GroupMe (full transcript + optional summary)
       try {
         if (labeled) {
-          await sendGroupMe(`🗣️ Transcript\n${labeled}`);
+          await sendGroupMe(`🗣️ Transcript
+${labeled}`);
         } else {
           await sendGroupMe("🗣️ Transcript unavailable.");
         }
@@ -334,7 +336,8 @@ async function handleTwilio(ws, req) {
       // Optional compact summary (2–3 sentences) using total text
       try {
         const base = filledTurns.map((t) => `${t.role === 'assistant' ? 'Assistant' : 'Caller'}: ${t.text || ''}`)
-                                .join('\n').trim();
+                                .join('
+').trim();
         if (base.length > 30) {
           const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
@@ -478,7 +481,8 @@ function splitIntoSentences(text) {
   const s = text.trim();
   if (!s) return [];
   // Simple sentence split: ., !, ? followed by space/newline; keep punctuation
-  const parts = s.match(/[^.!?\n]+[.!?]?/g) || [s];
+  const parts = s.match(/[^.!?
+]+[.!?]?/g) || [s];
   return parts.map((x) => x.trim()).filter(Boolean);
 }
 
