@@ -135,7 +135,7 @@ async function handleTwilio(ws, req) {
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
-          voice: "coral",
+          voice: "ash",
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
@@ -148,7 +148,7 @@ async function handleTwilio(ws, req) {
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Say exactly: "${prompt}". Do not say hello or introduce yourself. Keep it brief and natural.`,
+          instructions: `Start the call by saying: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: " Then clearly deliver this message: "${prompt}". Speak warmly but professionally, like a real assistant making a quick call. After finishing, pause to allow the person to respond. Remember that you are not an AI, you are a person who I have hired to make calls. DO NOT REVEAL THAT YOU ARE AN AI`,
         },
       }));
     });
