@@ -1,8 +1,8 @@
-// server.js — GroupMe + Twilio + OpenAI voice with FULL transcript (Assistant + Caller)
+// server.js — All-in-one Render bot: GroupMe + Twilio + OpenAI voice (with transcript sent to GroupMe)
 import express from "express";
 import fetch from "node-fetch";
 import { WebSocketServer, WebSocket } from "ws";
-// Node 18+ provides global FormData and Blob via undici (no extra deps)
+// Using Node 18+ built-in FormData (no extra package needed)
 
 const app = express();
 app.use(express.json());
@@ -61,7 +61,12 @@ app.get("/twiml", (req, res) => {
   let loopFlag = req.query.loop === "1";
   const host = req.get("host");
 
-  if (!loopFlag) loopFlag = true;
+  console.log("TwiML served for prompt:", prompt, "loop:", loopFlag);
+
+  if (!loopFlag) {
+    console.log("No loop flag detected — forcing loop mode for safety.");
+    loopFlag = true;
+  }
 
   const wsUrl = `wss://${host}/twilio`;
   const promptAttr = String(prompt).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
@@ -80,11 +85,10 @@ app.get("/twiml", (req, res) => {
   res.set("Content-Type", "text/xml").send(xml);
 });
 
-// === WebSocket bridge (Twilio <-> OpenAI Realtime) ===
+// === WebSocket audio bridge (Twilio <-> OpenAI) ===
 const server = app.listen(process.env.PORT || 10000, () =>
   console.log("Server listening on", server.address().port)
 );
-
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   if (req.url.startsWith("/twilio")) {
@@ -105,24 +109,18 @@ async function handleTwilio(ws, req) {
   let streamSid = null;
   let started = false;
 
-  // Collect raw μ-law audio from the call (caller side)
   const mulawChunks = [];
 
-  // Track model socket & flow
   let oai = null;
   let oaiReady = false;
   let commitTimer = null;
-  let hasBufferedAudio = false;
   const DEBOUNCE_MS = 700;
-
-  // Capture what the assistant actually spoke (from OpenAI)
-  let assistantTranscript = "";
 
   function ensureOpenAI() {
     if (oai) return;
 
     oai = new WebSocket(
-      "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview",
+      `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`,
       "realtime",
       {
         headers: {
@@ -134,70 +132,43 @@ async function handleTwilio(ws, req) {
 
     oai.on("open", () => {
       oaiReady = true;
-
-      // Configure voice + audio formats to match Twilio (G.711 μ-law @ 8kHz)
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
-          voice: "ash",                          // calmer voice
+          voice: "alloy",
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           turn_detection: { type: "server_vad" },
-          instructions: "You are a human call assistant. Speak in clear American English. Be brief and natural."
+          instructions: "You are a friendly phone agent. Speak ONLY in clear American English. Be concise and natural. Do not add extra questions or follow-ups.",
         },
       }));
-
-      // First turn: explicitly say the intro + user message (no extra fluff)
       oai.send(JSON.stringify({
         type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          instructions:
-            `Hello! I am Oscar's call assistant. Oscar asked me to relay this message:\n\n${prompt}\n\n` +
-            `Please respond if you have any questions.`,
-        },
+        response: { modalities: ["audio", "text"], instructions: prompt },
       }));
     });
 
     oai.on("message", (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-
-      const t = msg.type;
-
-      // Forward audio chunks back to Twilio
-      const isAudioDelta = (t === "response.audio.delta" || t === "response.output_audio.delta");
-      if (isAudioDelta && msg.delta && streamSid) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: msg.delta },
-          }));
+      try {
+        const msg = JSON.parse(data.toString());
+        const isDelta =
+          msg.type === "response.audio.delta" || msg.type === "response.output_audio.delta";
+        if (isDelta && msg.delta && streamSid) {
+          ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
         }
-      }
-
-      // Capture what the model said (for Assistant: ...)
-      if (t === "response.audio_transcript.delta" && msg.delta) {
-        assistantTranscript += msg.delta;
-      }
-      if ((t === "response.output_text.delta" || t === "response.text.delta") && msg.delta) {
-        assistantTranscript += msg.delta;
+      } catch (err) {
+        console.error("Error relaying OpenAI audio:", err);
       }
     });
 
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
-    oai.on("close", () => {
-      try { ws.close(); } catch {}
-    });
+    oai.on("close", () => { try { ws.close(); } catch {} });
   }
 
   ws.on("message", async (buf) => {
     let msg;
     try { msg = JSON.parse(buf.toString()); } catch { return; }
-
-    if (msg.event === "connected") return;
 
     if (msg.event === "start" && !started) {
       started = true;
@@ -205,92 +176,47 @@ async function handleTwilio(ws, req) {
       const cp = msg.start?.customParameters || {};
       if (typeof cp.prompt === "string" && cp.prompt.trim()) prompt = cp.prompt.trim();
       echoMode = cp.loop === "1";
-      assistantTranscript = "";     // reset at start of call
-      hasBufferedAudio = false;
       if (!echoMode) ensureOpenAI();
       return;
     }
 
     if (msg.event === "media" && streamSid) {
-      // Save caller μ-law audio for full-call transcription later
       if (msg.media?.payload) {
         try { mulawChunks.push(Buffer.from(msg.media.payload, "base64")); } catch {}
       }
-
-      // Stream live audio into the model (for turn-taking)
       if (!echoMode && oai && oaiReady && oai.readyState === WebSocket.OPEN) {
-        oai.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: msg.media.payload,
-        }));
-        hasBufferedAudio = true;
-
-        // Debounce: when the caller pauses, commit so the model can respond
+        oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
         if (commitTimer) clearTimeout(commitTimer);
         commitTimer = setTimeout(() => {
           try {
-            if (hasBufferedAudio) {
-              oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-              hasBufferedAudio = false;
-            }
-            oai.send(JSON.stringify({
-              type: "response.create",
-              response: { modalities: ["audio", "text"] },
-            }));
-          } catch (err) {
-            console.error("Commit/send error:", err);
-          }
+            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+            oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio", "text"] } }));
+          } catch (err) { console.error("Commit/send error:", err); }
         }, DEBOUNCE_MS);
       }
       return;
     }
 
     if (msg.event === "stop") {
-      console.log("Call stopped. Building full transcript…");
-
-      // Try to finalize any leftover audio first
-      if (oai && oaiReady) {
-        try {
-          if (hasBufferedAudio) {
-            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-            hasBufferedAudio = false;
-          }
-        } catch {}
-        try { oai.close(); } catch {}
-      }
-
       try {
-        // Transcribe caller audio we captured from Twilio (μ-law -> WAV -> Whisper)
-        const callerText = await (async () => {
-          if (!mulawChunks.length) return "";
+        if (oai && oaiReady) {
+          try { oai.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
+          try { oai.close(); } catch {}
+        }
+        if (mulawChunks.length) {
           const mulawBuffer = Buffer.concat(mulawChunks);
           const wavBuffer = mulawToWavPcm16Mono8k(mulawBuffer);
-          return await openaiTranscribeWav(wavBuffer);
-        })();
-
-        // Build labeled transcript
-        const a = (assistantTranscript || "").trim();
-        const c = (callerText || "").trim();
-
-        let payload = "";
-        if (a) payload += `Assistant: ${a}`;
-        if (c) payload += (payload ? "\n\n" : "") + `Caller: ${c}`;
-        if (!payload) payload = "(no audio captured)";
-
-        await sendGroupMe(`🗣️ Call transcript\n${payload}`);
-      } catch (err) {
-        console.error("Transcription error:", err);
-        await sendGroupMe("📝 Call transcript failed due to an error.");
+          const transcript = await openaiTranscribeWav(wavBuffer);
+          if (transcript) {
+            await sendGroupMe(`🗣️ Transcript from call: ${transcript}`);
+          }
+        }
+      } catch (e) {
+        console.error("stop handler error:", e);
       }
-
       try { ws.close(); } catch {}
       return;
     }
-  });
-
-  ws.on("error", (err) => console.error("Twilio WS error:", err));
-  ws.on("close", () => {
-    try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
   });
 }
 
@@ -305,31 +231,17 @@ function normalizePhone(s) {
 
 async function makeTwilioCallWithTwiml(to, promptText) {
   const api = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls.json`;
-  const auth = Buffer.from(
-    `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
-  ).toString("base64");
-
+  const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString("base64");
   const safePrompt = String(promptText).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
   const streamUrl = `wss://${process.env.BASE_HOST || "relaybot-2-0.onrender.com"}/twilio`;
-
   const twiml =
     `<?xml version="1.0" encoding="UTF-8"?><Response>` +
     `<Connect><Stream url="${streamUrl}">` +
     `<Parameter name="prompt" value="${safePrompt}"/>` +
     `<Parameter name="loop" value="0"/>` +
     `</Stream></Connect></Response>`;
-
-  const body = new URLSearchParams({
-    To: to,
-    From: process.env.TWILIO_FROM_NUMBER,
-    Twiml: twiml,
-  });
-
-  return fetch(api, {
-    method: "POST",
-    headers: { Authorization: `Basic ${auth}` },
-    body,
-  });
+  const body = new URLSearchParams({ To: to, From: process.env.TWILIO_FROM_NUMBER, Twiml: twiml });
+  return fetch(api, { method: "POST", headers: { Authorization: `Basic ${auth}` }, body });
 }
 
 async function sendGroupMe(text) {
@@ -340,30 +252,21 @@ async function sendGroupMe(text) {
   });
 }
 
-// Convert Twilio μ-law (8 kHz mono) to 16-bit PCM WAV
 function mulawToWavPcm16Mono8k(muBuf) {
   const pcm = Buffer.alloc(muBuf.length * 2);
   for (let i = 0; i < muBuf.length; i++) {
     const s = mulawDecodeSample(muBuf[i]);
-    // Clamp & write as 16-bit little-endian
-    const clamped = Math.max(-32768, Math.min(32767, s));
-    pcm.writeInt16LE(clamped, i * 2);
+    pcm.writeInt16LE(s, i * 2);
   }
-  const wavHeader = makeWavHeader({
-    sampleRate: 8000,
-    channels: 1,
-    bytesPerSample: 2,
-    dataLength: pcm.length
-  });
+  const wavHeader = makeWavHeader({ sampleRate: 8000, channels: 1, bytesPerSample: 2, dataLength: pcm.length });
   return Buffer.concat([wavHeader, pcm]);
 }
 
 function mulawDecodeSample(mu) {
-  // ITU-T G.711 μ-law decode with bias, then clamp in caller
   mu = ~mu & 0xff;
   const sign = mu & 0x80;
-  const exponent = (mu >> 4) & 0x07;
-  const mantissa = mu & 0x0f;
+  let exponent = (mu >> 4) & 0x07;
+  let mantissa = mu & 0x0f;
   let sample = ((mantissa << 4) + 0x08) << (exponent + 3);
   sample -= 0x84;
   if (sign) sample = -sample;
@@ -374,13 +277,12 @@ function makeWavHeader({ sampleRate, channels, bytesPerSample, dataLength }) {
   const blockAlign = channels * bytesPerSample;
   const byteRate = sampleRate * blockAlign;
   const buffer = Buffer.alloc(44);
-
   buffer.write("RIFF", 0);
   buffer.writeUInt32LE(36 + dataLength, 4);
   buffer.write("WAVE", 8);
   buffer.write("fmt ", 12);
-  buffer.writeUInt32LE(16, 16);              // PCM header size
-  buffer.writeUInt16LE(1, 20);               // PCM format
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20);
   buffer.writeUInt16LE(channels, 22);
   buffer.writeUInt32LE(sampleRate, 24);
   buffer.writeUInt32LE(byteRate, 28);
@@ -388,31 +290,20 @@ function makeWavHeader({ sampleRate, channels, bytesPerSample, dataLength }) {
   buffer.writeUInt16LE(bytesPerSample * 8, 34);
   buffer.write("data", 36);
   buffer.writeUInt32LE(dataLength, 40);
-
   return buffer;
 }
 
-// Use Whisper to transcribe the WAV buffer (Node 18+ Blob/FormData)
 async function openaiTranscribeWav(wavBuffer) {
   if (!process.env.OPENAI_API_KEY) return "";
-
-  const blob = new Blob([wavBuffer], { type: "audio/wav" });
   const form = new FormData();
-  // Important: filename must be provided as 3rd arg with undici FormData
-  form.append("file", blob, "call.wav");
+  form.append("file", wavBuffer, { filename: "call.wav", contentType: "audio/wav" });
   form.append("model", "whisper-1");
-
   const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
     body: form,
   });
-
-  if (!resp.ok) {
-    const errText = await resp.text().catch(() => "");
-    console.error("Whisper error:", resp.status, errText);
-    return "";
-  }
+  if (!resp.ok) return "";
   const json = await resp.json();
   return json.text || "";
 }
