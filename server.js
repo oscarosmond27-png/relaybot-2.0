@@ -241,8 +241,7 @@ async function handleTwilio(ws, req) {
           return line.length ? line : null;
         })
         .filter(Boolean)
-        .join('
-');
+        .join('\\n');
 
       await sendGroupMe(`🗣️ Transcript
 ${labeled}`);
