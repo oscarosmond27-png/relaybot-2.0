@@ -1,4 +1,4 @@
-// server.js — GroupMe + Twilio + OpenAI voice (cleaned and simplified)
+// server.js — GroupMe + Twilio + OpenAI voice (cleaned, with full transcription)
 import express from "express";
 import fetch from "node-fetch";
 import { WebSocketServer, WebSocket } from "ws";
@@ -108,12 +108,14 @@ async function handleTwilio(ws, req) {
   let streamSid = null;
   let started = false;
 
-  let transcriptText = ""; // collect everything said
-  let hasBufferedAudio = false;
+  // collect all caller audio (μ-law) so we can transcribe with Whisper later
+  const mulawChunks = [];
 
+  // OpenAI realtime socket state
   let oai = null;
   let oaiReady = false;
   let commitTimer = null;
+  let hasBufferedAudio = false;
   const DEBOUNCE_MS = 700;
 
   function ensureOpenAI() {
@@ -132,46 +134,41 @@ async function handleTwilio(ws, req) {
 
     oai.on("open", () => {
       oaiReady = true;
+      // session config
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
-          voice: "ash",
+          voice: "ash",                       // you can change voices here
           modalities: ["audio", "text"],
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
+          input_audio_format: "g711_ulaw",    // Twilio -> us
+          output_audio_format: "g711_ulaw",   // us -> Twilio
           turn_detection: { type: "server_vad" },
-          instructions:
-            "You are a friendly but concise phone agent. Speak in clear American English. Keep calls under 2 minutes.",
+          instructions: "You are a friendly but concise phone agent. Speak in clear American English. Keep calls under 2 minutes.",
         },
       }));
+      // opening line + your message
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Start the call by saying: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: " Then clearly deliver this message: "${prompt}". Speak warmly but professionally, like a real assistant making a quick call. After finishing, pause to allow the person to respond. Remember that you are not an AI, you are a person who I have hired to make calls. DO NOT REVEAL THAT YOU ARE AN AI`,
+          instructions: `Start the call by saying: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: " Then clearly deliver this message: "${prompt}". Speak warmly but professionally, like a real assistant making a quick call. After finishing, pause to allow the person to respond. Remember that you are not an AI; you are a person hired to make calls. Do not add extra small talk.`,
         },
       }));
     });
 
+    // stream OpenAI audio back to Twilio
     oai.on("message", (data) => {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
-
       const t = msg.type;
-      const isAudio = t === "response.audio.delta" || t === "response.output_audio.delta";
-      if (isAudio && msg.delta && streamSid) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            event: "media",
-            streamSid,
-            media: { payload: msg.delta },
-          }));
-        }
-      }
-
-      // Capture transcript deltas (spoken text)
-      if (t === "response.audio_transcript.delta" && msg.delta) {
-        transcriptText += msg.delta;
+      const isAudio =
+        t === "response.audio.delta" || t === "response.output_audio.delta";
+      if (isAudio && msg.delta && streamSid && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: msg.delta },
+        }));
       }
     });
 
@@ -197,6 +194,12 @@ async function handleTwilio(ws, req) {
     }
 
     if (msg.event === "media" && streamSid) {
+      // keep a copy of raw μ-law from Twilio so we can transcribe later
+      if (msg.media?.payload) {
+        try { mulawChunks.push(Buffer.from(msg.media.payload, "base64")); } catch {}
+      }
+
+      // forward to OpenAI in realtime
       if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
         oai.send(JSON.stringify({
           type: "input_audio_buffer.append",
@@ -224,54 +227,29 @@ async function handleTwilio(ws, req) {
     }
 
     if (msg.event === "stop") {
-      console.log("Call stopped. Summarizing via GPT-4o-mini…");
+      console.log("Call stopped. Building full transcript…");
 
-      if (oai && oai.readyState === WebSocket.OPEN) {
-        try { oai.close(); } catch {}
-      }
+      // close realtime socket (we've got the audio captured)
+      try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
 
       try {
-        const transcript = transcriptText.trim();
-        if (transcript.length < 30) {
-          await sendGroupMe("📝 Call summary: No usable transcript captured.");
-          try { ws.close(); } catch {}
-          return;
-        }
+        if (mulawChunks.length) {
+          // convert μ-law to WAV (PCM16 mono 8k) for Whisper
+          const mulawBuffer = Buffer.concat(mulawChunks);
+          const wavBuffer = mulawToWavPcm16Mono8k(mulawBuffer);
+          const transcript = await openaiTranscribeWav(wavBuffer);
 
-        const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content:
-                  "You are a neutral assistant that summarizes phone calls in plain English.",
-              },
-              {
-                role: "user",
-                content:
-                  `Here is the transcript of a phone call:\n\n${transcript}\n\nSummarize what was said in 2–3 sentences. Be factual and concise.`,
-              },
-            ],
-          }),
-        });
-
-        const data = await summaryResponse.json();
-        const summary = data.choices?.[0]?.message?.content?.trim();
-
-        if (summary) {
-          await sendGroupMe(`📝 Call summary: ${summary}`);
+          if (transcript && transcript.trim().length) {
+            await sendGroupMe(`🗣️ Full call transcript:\n${transcript.trim()}`);
+          } else {
+            await sendGroupMe("🗣️ Transcript unavailable (empty result).");
+          }
         } else {
-          await sendGroupMe("📝 Call summary unavailable.");
+          await sendGroupMe("🗣️ Transcript unavailable (no audio).");
         }
       } catch (err) {
-        console.error("Error generating summary:", err);
-        await sendGroupMe("📝 Call summary failed due to error.");
+        console.error("Transcription error:", err);
+        await sendGroupMe("🗣️ Transcript failed due to an error.");
       }
 
       try { ws.close(); } catch {}
@@ -281,9 +259,7 @@ async function handleTwilio(ws, req) {
 
   ws.on("error", (err) => console.error("Twilio WS error:", err));
   ws.on("close", () => {
-    if (oai && oai.readyState === WebSocket.OPEN) {
-      try { oai.close(); } catch {}
-    }
+    try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
   });
 }
 
@@ -331,4 +307,73 @@ async function sendGroupMe(text) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ bot_id: process.env.GROUPME_BOT_ID, text }),
   });
+}
+
+// === μ-law -> WAV (PCM16 mono 8k) and Whisper ===
+function mulawToWavPcm16Mono8k(muBuf) {
+  const pcm = Buffer.alloc(muBuf.length * 2);
+  for (let i = 0; i < muBuf.length; i++) {
+    const s = mulawDecodeSample(muBuf[i]);
+    pcm.writeInt16LE(s, i * 2);
+  }
+  const wavHeader = makeWavHeader({
+    sampleRate: 8000,
+    channels: 1,
+    bytesPerSample: 2,
+    dataLength: pcm.length,
+  });
+  return Buffer.concat([wavHeader, pcm]);
+}
+
+function mulawDecodeSample(mu) {
+  mu = ~mu & 0xff;
+  const sign = mu & 0x80;
+  let exponent = (mu >> 4) & 0x07;
+  let mantissa = mu & 0x0f;
+  let sample = ((mantissa << 4) + 0x08) << (exponent + 3);
+  sample -= 0x84;
+  if (sign) sample = -sample;
+  return sample;
+}
+
+function makeWavHeader({ sampleRate, channels, bytesPerSample, dataLength }) {
+  const blockAlign = channels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const buffer = Buffer.alloc(44);
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + dataLength, 4);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20); // PCM
+  buffer.writeUInt16LE(channels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(byteRate, 28);
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(bytesPerSample * 8, 34);
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(dataLength, 40);
+  return buffer;
+}
+
+async function openaiTranscribeWav(wavBuffer) {
+  if (!process.env.OPENAI_API_KEY) return "";
+
+  // Node 18+ has a global FormData (from undici), so we can use it directly.
+  const form = new FormData();
+  form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "call.wav");
+  form.append("model", "whisper-1");
+
+  const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+    body: form,
+  });
+
+  if (!resp.ok) {
+    console.error("Whisper HTTP error:", resp.status, await resp.text());
+    return "";
+  }
+  const json = await resp.json();
+  return json.text || "";
 }
