@@ -108,9 +108,14 @@ async function handleTwilio(ws, req) {
   let streamSid = null;
   let started = false;
 
+  // Chronological turns (placeholders, then filled at end)
+  // Each entry: { role: 'assistant'|'caller', text?: string }
+  const turns = [];
+  const callerTurns = []; // placeholders for caller chunks (indices map to turns entries)
+
   // Speaker-labeled capture
-  let assistantTranscript = "";           // assistant words (from OpenAI realtime)
-  let ulawChunks = [];                    // caller audio frames (μ-law base64 -> Buffer)
+  let assistantTranscript = "";           // total assistant words (still kept for summary)
+  let ulawChunks = [];                    // caller μ-law frames (base64 -> Buffer)
 
   // Realtime plumbing
   let hasBufferedAudio = false;
@@ -118,6 +123,23 @@ async function handleTwilio(ws, req) {
   let oaiReady = false;
   let commitTimer = null;
   const DEBOUNCE_MS = 700;
+
+  // Track assistant response boundaries for proper turn segmentation
+  let currentAssistantText = "";
+  let assistantTurnOpen = false;
+
+  function openAssistantTurn() {
+    if (assistantTurnOpen) return; // avoid double-open
+    assistantTurnOpen = true;
+    currentAssistantText = "";
+    turns.push({ role: "assistant" });
+  }
+  function closeAssistantTurn() {
+    if (!assistantTurnOpen) return;
+    assistantTurnOpen = false;
+    const idx = turns.findIndex((t) => t.role === "assistant" && t.text === undefined);
+    if (idx !== -1) turns[idx].text = currentAssistantText.trim();
+  }
 
   function ensureOpenAI() {
     if (oai) return;
@@ -147,6 +169,8 @@ async function handleTwilio(ws, req) {
             "You are a friendly but concise phone agent. Keep responses short, natural, and never mention AI or internal tools.",
         },
       }));
+      // First assistant intro -> open a turn now
+      openAssistantTurn();
       oai.send(JSON.stringify({
         type: "response.create",
         response: {
@@ -172,9 +196,17 @@ async function handleTwilio(ws, req) {
         }
       }
 
-      // Capture assistant transcript deltas (spoken text)
-      if (t === "response.audio_transcript.delta" && msg.delta) {
+      // Assistant transcript boundaries & deltas
+      if (t === "response.created") {
+        // A new assistant response is starting -> open a new assistant turn
+        openAssistantTurn();
+      }
+      if ((t === "response.audio_transcript.delta" || t === "response.output_text.delta") && msg.delta) {
         assistantTranscript += msg.delta;
+        if (assistantTurnOpen) currentAssistantText += msg.delta;
+      }
+      if (t === "response.completed" || t === "response.output_audio.done" || t === "response.error") {
+        closeAssistantTurn();
       }
     });
 
@@ -215,6 +247,12 @@ async function handleTwilio(ws, req) {
               oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
               hasBufferedAudio = false;
             }
+            // Debounce boundary reached -> close any open assistant turn (should have just finished),
+            // and open a placeholder CALLER turn so we can interleave later
+            turns.push({ role: "caller" });
+            callerTurns.push({}); // placeholder slot matching this caller turn
+
+            // Ask assistant to respond (which will open a new assistant turn when created)
             oai.send(JSON.stringify({
               type: "response.create",
               response: { modalities: ["audio", "text"] },
@@ -252,9 +290,10 @@ async function handleTwilio(ws, req) {
           const pcm16 = ulawToPcm16(ulaw);
           const wav = pcm16ToWav(pcm16, 8000);
 
-          // Transcribe with Whisper
+          // Transcribe with Whisper (verbose to keep room for future word/seg timing)
           const fd = new FormData();
           fd.append("model", "whisper-1");
+          fd.append("response_format", "json");
           fd.append("file", new Blob([wav], { type: "audio/wav" }), "call.wav");
 
           const tr = await fetch("https://api.openai.com/v1/audio/transcriptions", {
@@ -270,10 +309,16 @@ async function handleTwilio(ws, req) {
         console.error("Whisper transcription error:", err);
       }
 
-      // Combine into speaker-labeled transcript
-      const labeled =
-        (assistantTranscript ? `Assistant: ${assistantTranscript.trim()}\n` : "") +
-        (callerTranscript ?   `Caller: ${callerTranscript.trim()}`           : "");
+      // --- Distribute caller transcript across caller turns to preserve chronology ---
+      const filledTurns = interleaveCallerText(turns, callerTranscript, callerTurns.length);
+
+      // Build final labeled transcript
+      const labeled = filledTurns
+        .map((t) => t.role === "assistant"
+          ? (t.text ? `Assistant: ${t.text}` : null)
+          : (t.text ? `Caller: ${t.text}` : null))
+        .filter(Boolean)
+        .join("\n");
 
       // Post to GroupMe (full transcript + optional summary)
       try {
@@ -286,9 +331,10 @@ async function handleTwilio(ws, req) {
         console.error("GroupMe post error:", e);
       }
 
-      // Optional compact summary (2–3 sentences)
+      // Optional compact summary (2–3 sentences) using total text
       try {
-        const base = (assistantTranscript + "\n" + callerTranscript).trim();
+        const base = filledTurns.map((t) => `${t.role === 'assistant' ? 'Assistant' : 'Caller'}: ${t.text || ''}`)
+                                .join('\n').trim();
         if (base.length > 30) {
           const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
@@ -325,6 +371,7 @@ async function handleTwilio(ws, req) {
     }
   });
 }
+
 
 // === Helper functions ===
 function normalizePhone(s) {
@@ -424,4 +471,43 @@ function pcm16ToWav(pcm16, sampleRate = 8000) {
   // samples
   for (let i = 0; i < pcm16.length; i++) buffer.writeInt16LE(pcm16[i], 44 + i * 2);
   return buffer;
+}
+
+// === Caller text interleaving ===
+function splitIntoSentences(text) {
+  const s = text.trim();
+  if (!s) return [];
+  // Simple sentence split: ., !, ? followed by space/newline; keep punctuation
+  const parts = s.match(/[^.!?\n]+[.!?]?/g) || [s];
+  return parts.map((x) => x.trim()).filter(Boolean);
+}
+
+function interleaveCallerText(turns, callerTranscript, callerTurnCount) {
+  // If there are no caller turns, just return assistant turns as-is
+  if (!callerTurnCount) return turns.map((t) => ({ ...t }));
+
+  const sentences = splitIntoSentences(callerTranscript);
+  if (sentences.length === 0) {
+    // Nothing to fill
+    return turns.map((t) => ({ ...t }));
+  }
+
+  // Distribute sentences across caller turns as evenly as possible
+  const buckets = Array.from({ length: callerTurnCount }, () => []);
+  for (let i = 0; i < sentences.length; i++) {
+    buckets[i % callerTurnCount].push(sentences[i]);
+  }
+
+  // Construct new turns with caller text filled in order
+  let callerIdx = 0;
+  const filled = turns.map((t) => {
+    if (t.role === "caller") {
+      const chunk = buckets[callerIdx] || [];
+      callerIdx++;
+      return { role: "caller", text: chunk.join(" ").trim() };
+    }
+    return { role: "assistant", text: (t.text || "").trim() };
+  });
+
+  return filled;
 }
