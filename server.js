@@ -318,8 +318,7 @@ async function handleTwilio(ws, req) {
           ? (t.text ? `Assistant: ${t.text}` : null)
           : (t.text ? `Caller: ${t.text}` : null))
         .filter(Boolean)
-        .join("
-");
+        .join('\n');
 
       // Post to GroupMe (full transcript + optional summary)
       try {
