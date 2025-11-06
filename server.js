@@ -149,7 +149,7 @@ async function handleTwilio(ws, req) {
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Start with: \"Hello! I am Oscar's personal call assistant...\" and deliver: ${prompt}`,
+          instructions: `Start with: \"Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: \" and deliver: ${prompt} . Then ask a follow up question to keep the conversation going based on the prompt you delivered to the caller, which is ${prompt}`,
         },
       }));
     });
