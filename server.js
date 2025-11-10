@@ -67,7 +67,7 @@ app.get("/twiml", (req, res) => {
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
     `<Connect>` +
-    `<Stream url="${wsUrl}">` +
+    `<Stream url="${wsUrl}" track="inbound_track">` +
     `<Parameter name="prompt" value="${promptAttr}"/>` +
     `<Parameter name="loop" value="${loopFlag ? "1" : "0"}"/>` +
     `</Stream>` +
@@ -105,6 +105,7 @@ async function handleTwilio(ws, req) {
   let oaiReady = false;
   let commitTimer = null;
   const DEBOUNCE_MS = 700;
+  let currentCallerBytes = 0; // bytes since last commit for per-turn mapping
 
   let currentAssistantText = "";
   let assistantTurnOpen = false;
@@ -195,26 +196,32 @@ async function handleTwilio(ws, req) {
             }
             // Close any assistant turn that just finished speaking
             closeAssistantTurn();
-            // Record a caller turn placeholder at this boundary
+            // Record a caller turn placeholder with bytes accumulated since last commit
             turns.push({ role: "caller" });
-            callerTurns.push({});
+            callerTurns.push({ bytes: currentCallerBytes });
+            currentCallerBytes = 0;
             // Ask assistant to respond (a new assistant turn will open on response.created)
-            oai.send(JSON.stringify({
-              type: "response.create",
-              response: { modalities: ["audio", "text"] },
-            }));
+            oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio", "text"] } }));
           } catch (err) {
             console.error("Commit/send error:", err);
           }
         }, DEBOUNCE_MS);
       }
-      ulawChunks.push(Buffer.from(msg.media.payload, "base64"));
+      const chunk = Buffer.from(msg.media.payload, "base64");
+      ulawChunks.push(chunk);
+      currentCallerBytes += chunk.length;
       return;
     }
 
     if (msg.event === "stop") {
       // ensure any in-progress assistant turn is flushed
       closeAssistantTurn();
+      // if there's caller audio accumulated that wasn't committed yet, attribute it as a final caller turn
+      if (currentCallerBytes > 0) {
+        turns.push({ role: "caller" });
+        callerTurns.push({ bytes: currentCallerBytes });
+        currentCallerBytes = 0;
+      }
       try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
       const ulaw = Buffer.concat(ulawChunks);
       let callerTranscript = "";
@@ -234,18 +241,31 @@ async function handleTwilio(ws, req) {
         callerTranscript = (tj.text || "").trim();
       }
 
-      const filledTurns = interleaveCallerText(turns, callerTranscript, callerTurns.length);
+      // Build caller texts proportionally to audio bytes per turn
+      const callerTexts = distributeByBytes(callerTranscript, callerTurns);
+      let callerIdx = 0;
 
-// explode multi-line turns into single-utterance lines
-const exploded = explodeTurnsByNewlines(filledTurns);
+      // explode assistant multi-line turns; for caller, map proportional text
+      const chron = [];
+      for (const t of turns) {
+        if (t.role === "assistant") {
+          const exploded = explodeTurnsByNewlines([t]);
+          for (const e of exploded) if (e.text) chron.push(e);
+        } else {
+          const txt = normalizeTurnText(callerTexts[callerIdx++] || "");
+          if (!txt) continue;
+          const lines = txt.split(/\n+/).map(x=>x.trim()).filter(Boolean);
+          for (const line of lines) chron.push({ role: "caller", text: line });
+        }
+      }
 
-const labeled = exploded
-  .map((t) => `${t.role === "assistant" ? "Assistant" : "Caller"}: ${t.text}`)
-  .join('\n');
+      const labeled = chron
+        .map((t) => `${t.role === "assistant" ? "Assistant" : "Caller"}: ${t.text}`)
+        .join('\n');
 
-await sendGroupMe(`🗣️ Transcript\n${labeled}`);
+      await sendGroupMe(`🗣️ Transcript\n${labeled}`);
 
-      const base = exploded
+      const base = chron
         .map((t) => `${t.role === 'assistant' ? 'Assistant' : 'Caller'}: ${t.text}`)
         .join('\n')
         .trim();
@@ -270,6 +290,7 @@ await sendGroupMe(`🗣️ Transcript\n${labeled}`);
       }
       try { ws.close(); } catch {}
     }
+    }
   });
 }
 
@@ -288,7 +309,7 @@ async function makeTwilioCallWithTwiml(to, promptText) {
   const safePrompt = String(promptText).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
   const streamUrl = `wss://${process.env.BASE_HOST || "relaybot-2-0.onrender.com"}/twilio`;
   const twiml =
-    `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${streamUrl}">` +
+    `<?xml version="1.0" encoding="UTF-8"?><Response><Connect><Stream url="${streamUrl}" track="inbound_track">` +
     `<Parameter name="prompt" value="${safePrompt}"/><Parameter name="loop" value="0"/>` +
     `</Stream></Connect></Response>`;
   const body = new URLSearchParams({ To: to, From: process.env.TWILIO_FROM_NUMBER, Twiml: twiml });
@@ -340,9 +361,12 @@ function pcm16ToWav(pcm16, rate = 8000) {
 }
 function normalizeTurnText(s) {
   return String(s || "")
-    .replace(/\\n/g, "\n")
-    .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+/g, " ")
+    .replace(/\n/g, "
+")
+    .replace(/
+/g, "
+")
+    .replace(/[ 	]+/g, " ")
     .trim();
 }
 
@@ -351,7 +375,8 @@ function explodeTurnsByNewlines(turns) {
   for (const t of turns) {
     const text = normalizeTurnText(t.text);
     if (!text) continue;
-    const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+    const lines = text.split(/
++/).map(x => x.trim()).filter(Boolean);
     for (const line of lines) out.push({ role: t.role, text: line });
   }
   return out;
@@ -362,8 +387,35 @@ function splitIntoSentences(text) {
   if (!s) return [];
   return (s.match(/[^.!?\n]+[.!?]?/g) || [s]).map((x) => x.trim()).filter(Boolean);
 }
-function interleaveCallerText(turns, callerTranscript, callerTurnCount) {
-  if (!callerTurnCount) return turns.map((t) => ({ ...t }));
+function splitIntoSentences(text) {
+  const s = String(text || '').trim();
+  if (!s) return [];
+  return (s.match(/[^.!?\n]+[.!?]?/g) || [s]).map((x) => x.trim()).filter(Boolean);
+}
+
+// Distribute caller sentences to turns in proportion to captured bytes per turn
+function distributeByBytes(text, buckets) {
+  const sentences = splitIntoSentences(String(text || '').replace(/\n+/g, ' '));
+  if (!sentences.length || !buckets?.length) return buckets.map(()=>"");
+  const totalBytes = buckets.reduce((a,b)=>a + (b?.bytes||0), 0) || 1;
+  const targets = buckets.map(b => ((b?.bytes||0) / totalBytes) * sentences.length);
+  // Largest-remainder allocation
+  const baseCounts = targets.map(x => Math.floor(x));
+  let assigned = baseCounts.reduce((a,b)=>a+b,0);
+  const remainders = targets.map((x,i)=>({i, r: x - Math.floor(x)})).sort((a,b)=>b.r - a.r);
+  for (let k=0; assigned < sentences.length && k<remainders.length; k++) { baseCounts[remainders[k].i]++; assigned++; }
+  // Slice sentences in order
+  const out = [];
+  let cursor = 0;
+  for (let i=0;i<buckets.length;i++) {
+    const n = Math.max(0, baseCounts[i]|0);
+    out.push(sentences.slice(cursor, cursor+n).join(' ').trim());
+    cursor += n;
+  }
+  // In case of any leftover due to rounding, append to last
+  if (cursor < sentences.length && out.length) out[out.length-1] += (out[out.length-1] ? ' ' : '') + sentences.slice(cursor).join(' ');
+  return out;
+}));
   const sentences = splitIntoSentences(callerTranscript);
   if (!sentences.length) return turns.map((t) => ({ ...t }));
   const buckets = Array.from({ length: callerTurnCount }, () => []);
