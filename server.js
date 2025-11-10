@@ -1,4 +1,4 @@
-// server.js — fixed syntax issues and newline/regex handling
+// server.js — fixed syntax issues, robust caller/assistant interleaving, cleaner turn lifecycle
 import express from "express";
 import fetch, { FormData, Blob } from "node-fetch";
 import { WebSocketServer, WebSocket } from "ws";
@@ -104,9 +104,9 @@ async function handleTwilio(ws, req) {
   let oai = null;
   let oaiReady = false;
   let commitTimer = null;
-  const DEBOUNCE_MS = 700;
-  let currentCallerBytes = 0; // bytes since last commit for per-turn mapping
+  const DEBOUNCE_MS = 500; // quicker interleave
 
+  let currentCallerBytes = 0; // bytes since last commit for per-turn mapping
   let currentAssistantText = "";
   let assistantTurnOpen = false;
 
@@ -155,22 +155,51 @@ async function handleTwilio(ws, req) {
       }));
     });
 
+    // ********** UPDATED TURN/INTERLEAVE LOGIC **********
     oai.on("message", (data) => {
       let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
       const t = msg.type;
+
+      // If a new assistant response is created while caller audio is buffered,
+      // force a commit and materialize a caller turn so it interleaves properly.
+      if (t === "response.created") {
+        try {
+          if (hasBufferedAudio) {
+            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+            hasBufferedAudio = false;
+
+            if (currentCallerBytes > 0) {
+              turns.push({ role: "caller" });
+              callerTurns.push({ bytes: currentCallerBytes });
+              currentCallerBytes = 0;
+            }
+          }
+        } catch (e) {
+          console.error("forced commit on response.created failed:", e);
+        }
+        openAssistantTurn(); // ensure assistant turn is open
+        return;
+      }
+
       const isAudio = t === "response.audio.delta" || t === "response.output_audio.delta";
       if (isAudio && msg.delta && streamSid) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
         }
       }
-      if (t === "response.created") { closeAssistantTurn(); openAssistantTurn(); }
+
       if ((t === "response.audio_transcript.delta" || t === "response.output_text.delta") && msg.delta) {
         assistantTranscript += msg.delta;
         if (assistantTurnOpen) currentAssistantText += msg.delta;
+        return;
       }
-      if (["response.completed", "response.output_audio.done", "response.error"].includes(t)) closeAssistantTurn();
+
+      if (t === "response.completed" || t === "response.output_audio.done" || t === "response.error") {
+        closeAssistantTurn();
+        return;
+      }
     });
+    // ********** END UPDATED LOGIC **********
   }
 
   ws.on("message", async (buf) => {
@@ -185,10 +214,13 @@ async function handleTwilio(ws, req) {
       return;
     }
 
+    // ********** UPDATED MEDIA DEBOUNCE/COMMIT LOGIC **********
     if (msg.event === "media" && streamSid) {
       if (oai && oaiReady) {
         oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
         hasBufferedAudio = true;
+
+        // reset debounce timer
         if (commitTimer) clearTimeout(commitTimer);
         commitTimer = setTimeout(() => {
           try {
@@ -196,34 +228,43 @@ async function handleTwilio(ws, req) {
               oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
               hasBufferedAudio = false;
             }
-            // Close any assistant turn that just finished speaking
+
+            // Close any assistant turn that has finished
             closeAssistantTurn();
-            // Record a caller turn placeholder with bytes accumulated since last commit
-            turns.push({ role: "caller" });
-            callerTurns.push({ bytes: currentCallerBytes });
-            currentCallerBytes = 0;
-            // Ask assistant to respond (a new assistant turn will open on response.created)
+
+            // materialize caller turn from accumulated bytes
+            if (currentCallerBytes > 0) {
+              turns.push({ role: "caller" });
+              callerTurns.push({ bytes: currentCallerBytes });
+              currentCallerBytes = 0;
+            }
+
+            // prompt assistant to respond; assistant turn opens on response.created
             oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio", "text"] } }));
           } catch (err) {
             console.error("Commit/send error:", err);
           }
         }, DEBOUNCE_MS);
       }
+
       const chunk = Buffer.from(msg.media.payload, "base64");
       ulawChunks.push(chunk);
       currentCallerBytes += chunk.length;
       return;
     }
+    // ********** END UPDATED MEDIA LOGIC **********
 
     if (msg.event === "stop") {
       // ensure any in-progress assistant turn is flushed
       closeAssistantTurn();
-      // if there's caller audio accumulated that wasn't committed yet, attribute it as a final caller turn
+
+      // attribute any remaining caller bytes
       if (currentCallerBytes > 0) {
         turns.push({ role: "caller" });
         callerTurns.push({ bytes: currentCallerBytes });
         currentCallerBytes = 0;
       }
+
       try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
       const ulaw = Buffer.concat(ulawChunks);
       let callerTranscript = "";
