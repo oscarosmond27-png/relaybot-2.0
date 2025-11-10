@@ -1,4 +1,4 @@
-// server.js — fixed join() newline syntax and improved chronological interleaving
+// server.js — fixed syntax issues and newline/regex handling
 import express from "express";
 import fetch, { FormData, Blob } from "node-fetch";
 import { WebSocketServer, WebSocket } from "ws";
@@ -120,7 +120,7 @@ async function handleTwilio(ws, req) {
     if (!assistantTurnOpen) return;
     assistantTurnOpen = false;
     const idx = turns.findIndex((t) => t.role === "assistant" && !t.text);
-    if (idx !== -1) turns[idx].text = currentAssistantText.trim();
+    if (idx !== -1) turns[idx].text = (currentAssistantText || "").trim();
   }
 
   function ensureOpenAI() {
@@ -150,7 +150,7 @@ async function handleTwilio(ws, req) {
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Start with: \"Hello! I am Oscar's personal call assistant...\" and deliver: ${prompt}`,
+          instructions: `Start with: "Hello! I am Oscar's personal call assistant..." and deliver: ${prompt}`,
         },
       }));
     });
@@ -160,7 +160,9 @@ async function handleTwilio(ws, req) {
       const t = msg.type;
       const isAudio = t === "response.audio.delta" || t === "response.output_audio.delta";
       if (isAudio && msg.delta && streamSid) {
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
+        }
       }
       if (t === "response.created") { closeAssistantTurn(); openAssistantTurn(); }
       if ((t === "response.audio_transcript.delta" || t === "response.output_text.delta") && msg.delta) {
@@ -254,7 +256,7 @@ async function handleTwilio(ws, req) {
         } else {
           const txt = normalizeTurnText(callerTexts[callerIdx++] || "");
           if (!txt) continue;
-          const lines = txt.split(/\n+/).map(x=>x.trim()).filter(Boolean);
+          const lines = txt.split(/\n+/).map(x => x.trim()).filter(Boolean);
           for (const line of lines) chron.push({ role: "caller", text: line });
         }
       }
@@ -289,7 +291,6 @@ async function handleTwilio(ws, req) {
         if (summary) await sendGroupMe(`📝 Summary: ${summary}`);
       }
       try { ws.close(); } catch {}
-    }
     }
   });
 }
@@ -359,14 +360,12 @@ function pcm16ToWav(pcm16, rate = 8000) {
   for (let i = 0; i < pcm16.length; i++) buf.writeInt16LE(pcm16[i], 44 + i * 2);
   return buf;
 }
+
+// Keep newlines as real \n, collapse whitespace
 function normalizeTurnText(s) {
   return String(s || "")
-    .replace(/\n/g, "
-")
-    .replace(/
-/g, "
-")
-    .replace(/[ 	]+/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+/g, " ")
     .trim();
 }
 
@@ -375,51 +374,47 @@ function explodeTurnsByNewlines(turns) {
   for (const t of turns) {
     const text = normalizeTurnText(t.text);
     if (!text) continue;
-    const lines = text.split(/
-+/).map(x => x.trim()).filter(Boolean);
+    const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
     for (const line of lines) out.push({ role: t.role, text: line });
   }
   return out;
 }
 
 function splitIntoSentences(text) {
-  const s = text.trim();
-  if (!s) return [];
-  return (s.match(/[^.!?\n]+[.!?]?/g) || [s]).map((x) => x.trim()).filter(Boolean);
-}
-function splitIntoSentences(text) {
   const s = String(text || '').trim();
   if (!s) return [];
+  // Greedy-ish sentence splitting that respects ?, !, . and newlines
   return (s.match(/[^.!?\n]+[.!?]?/g) || [s]).map((x) => x.trim()).filter(Boolean);
 }
 
 // Distribute caller sentences to turns in proportion to captured bytes per turn
 function distributeByBytes(text, buckets) {
   const sentences = splitIntoSentences(String(text || '').replace(/\n+/g, ' '));
-  if (!sentences.length || !buckets?.length) return buckets.map(()=>"");
-  const totalBytes = buckets.reduce((a,b)=>a + (b?.bytes||0), 0) || 1;
-  const targets = buckets.map(b => ((b?.bytes||0) / totalBytes) * sentences.length);
+  if (!sentences.length || !buckets?.length) return (buckets || []).map(() => "");
+  const totalBytes = buckets.reduce((a, b) => a + (b?.bytes || 0), 0) || 1;
+  const targets = buckets.map(b => ((b?.bytes || 0) / totalBytes) * sentences.length);
+
   // Largest-remainder allocation
   const baseCounts = targets.map(x => Math.floor(x));
-  let assigned = baseCounts.reduce((a,b)=>a+b,0);
-  const remainders = targets.map((x,i)=>({i, r: x - Math.floor(x)})).sort((a,b)=>b.r - a.r);
-  for (let k=0; assigned < sentences.length && k<remainders.length; k++) { baseCounts[remainders[k].i]++; assigned++; }
+  let assigned = baseCounts.reduce((a, b) => a + b, 0);
+  const remainders = targets
+    .map((x, i) => ({ i, r: x - Math.floor(x) }))
+    .sort((a, b) => b.r - a.r);
+  for (let k = 0; assigned < sentences.length && k < remainders.length; k++) {
+    baseCounts[remainders[k].i]++; assigned++;
+  }
+
   // Slice sentences in order
   const out = [];
   let cursor = 0;
-  for (let i=0;i<buckets.length;i++) {
-    const n = Math.max(0, baseCounts[i]|0);
-    out.push(sentences.slice(cursor, cursor+n).join(' ').trim());
+  for (let i = 0; i < buckets.length; i++) {
+    const n = Math.max(0, baseCounts[i] | 0);
+    out.push(sentences.slice(cursor, cursor + n).join(' ').trim());
     cursor += n;
   }
   // In case of any leftover due to rounding, append to last
-  if (cursor < sentences.length && out.length) out[out.length-1] += (out[out.length-1] ? ' ' : '') + sentences.slice(cursor).join(' ');
+  if (cursor < sentences.length && out.length) {
+    out[out.length - 1] += (out[out.length - 1] ? ' ' : '') + sentences.slice(cursor).join(' ');
+  }
   return out;
-}));
-  const sentences = splitIntoSentences(callerTranscript);
-  if (!sentences.length) return turns.map((t) => ({ ...t }));
-  const buckets = Array.from({ length: callerTurnCount }, () => []);
-  for (let i = 0; i < sentences.length; i++) buckets[i % callerTurnCount].push(sentences[i]);
-  let idx = 0;
-  return turns.map((t) => t.role === "caller" ? { role: "caller", text: buckets[idx++].join(" ") } : { role: "assistant", text: t.text || "" });
 }
