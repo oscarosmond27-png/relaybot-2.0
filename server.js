@@ -149,7 +149,7 @@ async function handleTwilio(ws, req) {
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Start with: \"Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: \" and deliver: ${prompt} . Then ask a follow up question to keep the conversation going based on the prompt you delivered to the caller, which is ${prompt}`,
+          instructions: `Start with: \"Hello! I am Oscar's personal call assistant...\" and deliver: ${prompt}`,
         },
       }));
     });
@@ -235,19 +235,18 @@ async function handleTwilio(ws, req) {
       }
 
       const filledTurns = interleaveCallerText(turns, callerTranscript, callerTurns.length);
-      const labeled = filledTurns
-        .map((t) => {
-          const line = (t.role === "assistant" ? `Assistant: ${t.text || ""}` : `Caller: ${t.text || ""}`).trim();
-          return line.length ? line : null;
-        })
-        .filter(Boolean)
-        .join('\\n');
 
-      await sendGroupMe(`🗣️ Transcript
-${labeled}`);
+// explode multi-line turns into single-utterance lines
+const exploded = explodeTurnsByNewlines(filledTurns);
 
-      const base = filledTurns
-        .map((t) => `${t.role === 'assistant' ? 'Assistant' : 'Caller'}: ${t.text || ''}`)
+const labeled = exploded
+  .map((t) => `${t.role === "assistant" ? "Assistant" : "Caller"}: ${t.text}`)
+  .join('\n');
+
+await sendGroupMe(`🗣️ Transcript\n${labeled}`);
+
+      const base = exploded
+        .map((t) => `${t.role === 'assistant' ? 'Assistant' : 'Caller'}: ${t.text}`)
         .join('\n')
         .trim();
       if (base.length > 30) {
@@ -339,6 +338,25 @@ function pcm16ToWav(pcm16, rate = 8000) {
   for (let i = 0; i < pcm16.length; i++) buf.writeInt16LE(pcm16[i], 44 + i * 2);
   return buf;
 }
+function normalizeTurnText(s) {
+  return String(s || "")
+    .replace(/\\n/g, "\n")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+function explodeTurnsByNewlines(turns) {
+  const out = [];
+  for (const t of turns) {
+    const text = normalizeTurnText(t.text);
+    if (!text) continue;
+    const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
+    for (const line of lines) out.push({ role: t.role, text: line });
+  }
+  return out;
+}
+
 function splitIntoSentences(text) {
   const s = text.trim();
   if (!s) return [];
