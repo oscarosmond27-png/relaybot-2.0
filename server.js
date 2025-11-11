@@ -90,7 +90,7 @@ app.get("/twiml", (req, res) => {
   const xml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response><Connect>` +
-    `<Stream url="${wsUrl}" track="inbound_track">` +
+    `<Stream url="${wsUrl}" track="both_tracks">` +
     `<Parameter name="prompt" value="${promptAttr}"/>` +
     `<Parameter name="loop" value="${loopFlag ? "1" : "0"}"/>` +
     `</Stream>` +
@@ -184,8 +184,8 @@ async function handleTwilio(ws, req) {
         session: {
           voice: "ash",
           modalities: ["audio", "text"],
-          input_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
-          output_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
 
           input_audio_transcription: { model: "gpt-4o-mini-transcribe", enabled: true },
           instructions: "You are a friendly but concise phone agent.",
@@ -233,12 +233,13 @@ async function handleTwilio(ws, req) {
 
       if (t === "response.created") { openAssistantTurn(); return; }
 
-      const isAudio = t === "response.audio.delta" || t === "response.output_audio.delta";
-      if (isAudio && msg.delta && streamSid) {
+      if (t === "response.output_audio.delta" && msg.delta && streamSid) {
         if (ws.readyState === WebSocket.OPEN) {
+          // delta is base64 g711_ulaw from the model; send straight to Twilio
           ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
         }
       }
+
 
       if (t === "response.output_text.delta" && msg.delta) {
         assistantTranscript += msg.delta;
@@ -283,11 +284,20 @@ async function handleTwilio(ws, req) {
       if (oai && oaiReady) {
         oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
         if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          try {
-            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-          } catch {}
-        }, DEBOUNCE_MS);
+          debounceTimer = setTimeout(() => {
+            try {
+              // 1) Commit caller audio
+              oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+              // 2) Ask the assistant to respond (audio + text)
+              oai.send(JSON.stringify({
+                type: "response.create",
+                response: { modalities: ["audio", "text"] }
+              }));
+            } catch (e) {
+              console.error("commit/response.create error:", e);
+            }
+          }, DEBOUNCE_MS);
+
       }
       return;
     }
