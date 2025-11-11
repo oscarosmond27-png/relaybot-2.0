@@ -332,17 +332,25 @@ async function handleTwilio(ws, req) {
         }
         const pcm16 = ulawToPcm16(slice);
         const wav = pcm16ToWav(pcm16, 8000);
+        
         const fd = new FormData();
         fd.append("model", "whisper-1");
         fd.append("file", new Blob([wav], { type: "audio/wav" }), `turn_${i}.wav`);
         fd.append("temperature", "0");
+        fd.append("language", "en");
+        fd.append("response_format", "verbose_json"); // we want segments + scores for filtering
+        
         const tr = await fetch("https://api.openai.com/v1/audio/transcriptions", {
           method: "POST",
           headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
           body: fd,
         });
         const tj = await tr.json();
-        callerTexts.push((tj.text || "").trim());
+        
+        // Build a clean text from segments
+        const cleaned = mergeWhisperSegmentsVerboseJson(tj);
+        callerTexts.push(cleaned);
+
       }
 
       // ==== Build chronological transcript ====
@@ -461,6 +469,48 @@ function pcm16ToWav(pcm16, rate = 8000) {
   for (let i = 0; i < pcm16.length; i++) buf.writeInt16LE(pcm16[i], 44 + i * 2);
   return buf;
 }
+
+// === Whisper cleaning helpers (add below pcm16ToWav) ===
+function cleanCallerText(raw) {
+  let t = String(raw || "").trim();
+
+  // collapse repeated single words (e.g., "you you you" -> "you")
+  t = t.replace(/\b(\w+)(\s+\1\b){1,}/gi, "$1");
+
+  // collapse repeated short phrases (2–3 words)
+  t = t.replace(/\b(\w+\s+\w+)(\s+\1\b){1,}/gi, "$1");
+  t = t.replace(/\b(\w+\s+\w+\s+\w+)(\s+\1\b){1,}/gi, "$1");
+
+  // strip any accidental “instruction” echoes
+  t = t.replace(/subscribe only the human caller.*?(audio\.)?/i, "");
+
+  // normalize whitespace
+  t = t.replace(/\s+/g, " ").trim();
+
+  return t;
+}
+
+function mergeWhisperSegmentsVerboseJson(json) {
+  // Expected payload from whisper-1 when response_format=verbose_json
+  if (!json || !json.segments) return (json?.text || "").trim();
+
+  // Filter to keep only “real” speechy segments
+  const kept = json.segments.filter(seg => {
+    const dur = Math.max(0, (seg.end || 0) - (seg.start || 0));
+    const text = (seg.text || "").trim();
+
+    if (!text) return false;
+    if (seg.no_speech_prob !== undefined && seg.no_speech_prob > 0.6) return false; // likely silence
+    if (seg.avg_logprob !== undefined && seg.avg_logprob < -1.0) return false;      // very uncertain
+    if (dur < 0.45 && text.split(/\s+/).length <= 1) return false;                  // tiny blips like "you"
+    return true;
+  });
+
+  let out = kept.map(s => s.text.trim()).join(" ");
+  out = cleanCallerText(out);
+  return out;
+}
+
 
 // Clean whitespace (preserve \n)
 function normalizeTurnText(s) {
