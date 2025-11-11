@@ -105,6 +105,9 @@ async function handleTwilio(ws, req) {
 
   // Audio buffers
   let ulawChunks = [];
+  let recentCallerAudio = [];       // rolling μ-law buffer for live transcription
+  let lastLiveCallerText = "";      // what we’ve already posted
+  let liveWhisperTimer = null;      // polling timer
   let hasBufferedAudio = false;
 
   // OpenAI Realtime
@@ -131,18 +134,77 @@ async function handleTwilio(ws, req) {
 
   async function emitAssistantIfBoundary() {
     if (!LIVE_TO_GROUPME) return;
+  
+    // Emit on sentence end or when chunk gets long
     if (/[.!?]\s*$/.test(assistantLiveBuf) || assistantLiveBuf.length > 200) {
       const out = assistantLiveBuf.trim();
-      if (out) await sendGroupMe(`Assistant: ${out}`);
       assistantLiveBuf = "";
+      if (!out) return;
+  
+      // ✅ Prevent duplicate repeats
+      if (emitAssistantIfBoundary.lastSent === out) return;
+      emitAssistantIfBoundary.lastSent = out;
+  
+      await sendGroupMe(`Assistant: ${out}`);
     }
   }
+
   async function flushAssistantLive() {
     if (!LIVE_TO_GROUPME) return;
     const out = assistantLiveBuf.trim();
     if (out) await sendGroupMe(`Assistant: ${out}`);
     assistantLiveBuf = "";
   }
+  async function transcribeRecentCallerLive() {
+    if (!LIVE_TO_GROUPME || recentCallerAudio.length < 500) return;
+  
+    // Merge the last ~5s of audio
+    const slice = Buffer.concat(recentCallerAudio);
+    const pcm16 = ulawToPcm16(slice);
+    const wav = pcm16ToWav(pcm16, 8000);
+  
+    const fd = new FormData();
+    fd.append("model", "whisper-1");
+    fd.append("file", new Blob([wav], { type: "audio/wav" }), "live.wav");
+    fd.append("temperature", "0");
+    fd.append("language", "en");
+    fd.append("response_format", "verbose_json");
+  
+    try {
+      const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+        body: fd,
+      });
+      const j = await r.json();
+      const cleaned = mergeWhisperSegmentsVerboseJson(j);
+  
+      // post only new increments
+      if (cleaned && cleaned !== lastLiveCallerText) {
+        const diff = cleaned.replace(lastLiveCallerText, "").trim();
+        if (diff) await sendGroupMe(`Caller: ${diff}`);
+        lastLiveCallerText = cleaned;
+      }
+    } catch (e) {
+      console.error("live whisper error:", e);
+    }
+  }
+  
+  function startLiveCallerStream() {
+    if (liveWhisperTimer) return;
+    liveWhisperTimer = setInterval(() => {
+      transcribeRecentCallerLive();
+    }, 2000); // every 2 seconds
+  }
+  
+  function stopLiveCallerStream() {
+    if (liveWhisperTimer) clearInterval(liveWhisperTimer);
+    liveWhisperTimer = null;
+    recentCallerAudio = [];
+    lastLiveCallerText = "";
+  }
+
+  
 
   function openAssistantTurn() {
     if (assistantTurnOpen) return;
@@ -280,17 +342,18 @@ async function handleTwilio(ws, req) {
         }
       }
 
-      if ((t === "response.audio_transcript.delta" || t === "response.output_text.delta") && msg.delta) {
+      if (t === "response.output_text.delta" && msg.delta) {
         assistantTranscript += msg.delta;
         if (assistantTurnOpen) currentAssistantText += msg.delta;
-
-        // LIVE: buffer and emit on boundaries
+      
+        // LIVE: buffer and emit when we hit a sentence boundary
         if (LIVE_TO_GROUPME) {
           assistantLiveBuf += msg.delta;
           await emitAssistantIfBoundary();
         }
         return;
       }
+      
 
       if (t === "response.completed" || t === "response.output_audio.done" || t === "response.error") {
         await flushAssistantLive(); // flush any trailing chunk
@@ -320,6 +383,18 @@ async function handleTwilio(ws, req) {
       totalBytes += chunk.length;
       currentCallerBytes += chunk.length;
 
+      // --- live caller rolling buffer (~5 s) ---
+      recentCallerAudio.push(chunk);
+      const MAX_LIVE_WINDOW = 40000; // about 5 s of μ-law @8 kHz
+      let liveLen = recentCallerAudio.reduce((a, b) => a + b.length, 0);
+      while (liveLen > MAX_LIVE_WINDOW && recentCallerAudio.length) {
+        liveLen -= recentCallerAudio.shift().length;
+      }
+      
+      // start live Whisper polling if not already
+      startLiveCallerStream();
+
+
       if (oai && oaiReady) {
         oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
         hasBufferedAudio = true;
@@ -338,6 +413,7 @@ async function handleTwilio(ws, req) {
 
     if (msg.event === "stop") {
       stopped = true;
+      stopLiveCallerStream(); // stop live polling and clear buffers
       if (debounceTimer) clearTimeout(debounceTimer);
 
       // finalize any remaining caller audio
