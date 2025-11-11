@@ -1,4 +1,4 @@
-// server.js — gated assistant replies, stricter caller turn detection, per-turn transcription
+// server.js — strong interleaving: debounce + max-duration + immediate cut; single-flight assistant; per-turn transcription
 import express from "express";
 import fetch, { FormData, Blob } from "node-fetch";
 import { WebSocketServer, WebSocket } from "ws";
@@ -63,7 +63,7 @@ app.get("/twiml", (req, res) => {
   const wsUrl = `wss://${host}/twilio`;
   const promptAttr = String(prompt).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 
-  // Stream only inbound (caller) audio
+  // Stream only inbound (caller) audio so Whisper never hears the assistant playback
   const xml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
@@ -98,25 +98,32 @@ async function handleTwilio(ws, req) {
 
   const turns = [];            // [{role:'assistant'|'caller', text?}]
   const callerTurns = [];      // [{bytes, start, end}]
-  let totalBytes = 0;          // cumulative bytes of inbound u-law (caller)
+  let totalBytes = 0;          // cumulative bytes of inbound μ-law (caller)
   let currentCallerBytes = 0;  // bytes since last caller turn was committed
+  let lastCallerActivity = 0;
 
   let assistantTranscript = "";
   let ulawChunks = [];
   let hasBufferedAudio = false;
   let oai = null;
   let oaiReady = false;
-  let commitTimer = null;
 
-  // Tunables
-  const DEBOUNCE_MS = 700;           // silence window before treating as caller turn end
-  const MIN_CALLER_BYTES = 4000;     // ~0.5s of μ-law @8kHz; ignore tiny/noisy blips
+  // Timers/flags
+  let debounceTimer = null;
+  let slicerTimer = null;
+  let stopped = false;
+
+  // Tunables (adjust to taste)
+  const DEBOUNCE_MS = 600;           // silence window for end-of-turn
+  const MIN_CALLER_BYTES = 2000;     // ~0.25s @ 8kHz μ-law — smallest turn we accept
+  const MAX_CALLER_BYTES = 12000;    // ~1.5s cap — slice long monologues even without silence
+  const SLICE_POLL_MS   = 250;       // how often we check for slicing conditions
 
   // Assistant lifecycle
   let currentAssistantText = "";
   let assistantTurnOpen = false;
-  let awaitingAssistant = false;     // NEW: throttle response.create to one at a time
-  let greeted = false;               // single greeting only
+  let awaitingAssistant = false;     // single-flight guard for response.create
+  let greeted = false;               // send exactly one greeting
 
   function openAssistantTurn() {
     if (assistantTurnOpen) return;
@@ -131,27 +138,77 @@ async function handleTwilio(ws, req) {
     if (idx !== -1) turns[idx].text = (currentAssistantText || "").trim();
   }
 
-  function createCallerTurnIfEnoughBytes() {
-    if (currentCallerBytes >= MIN_CALLER_BYTES) {
-      const start = totalBytes - currentCallerBytes;
-      const end = totalBytes;
-      turns.push({ role: "caller" });
-      callerTurns.push({ bytes: currentCallerBytes, start, end });
-      currentCallerBytes = 0;
-      return true;
-    }
-    return false;
+  function materializeCallerTurn() {
+    if (currentCallerBytes < MIN_CALLER_BYTES) return false;
+    const start = totalBytes - currentCallerBytes;
+    const end = totalBytes;
+    turns.push({ role: "caller" });
+    callerTurns.push({ bytes: currentCallerBytes, start, end });
+    currentCallerBytes = 0;
+    return true;
   }
 
-  function maybeTriggerAssistant() {
-    // Only trigger if we actually formed a caller turn and we're not already waiting
-    if (awaitingAssistant) return;
+  function requestAssistantIfIdle() {
+    if (!oai || !oaiReady || awaitingAssistant || stopped) return;
     awaitingAssistant = true;
     try {
       oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio", "text"] } }));
     } catch (e) {
       awaitingAssistant = false;
       console.error("response.create failed:", e);
+    }
+  }
+
+  function commitBufferedAudio() {
+    if (!oai || !oaiReady || !hasBufferedAudio) return;
+    try {
+      oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      hasBufferedAudio = false;
+    } catch (e) {
+      console.error("commit error:", e);
+    }
+  }
+
+  function scheduleDebounce() {
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      // End-of-turn by silence
+      commitBufferedAudio();
+      if (materializeCallerTurn()) {
+        closeAssistantTurn();
+        requestAssistantIfIdle();
+      }
+    }, DEBOUNCE_MS);
+  }
+
+  function startSlicer() {
+    if (slicerTimer) return;
+    slicerTimer = setInterval(() => {
+      if (stopped) return;
+      // Immediate cut if segment is getting long
+      if (currentCallerBytes >= MAX_CALLER_BYTES) {
+        commitBufferedAudio();
+        if (materializeCallerTurn()) {
+          closeAssistantTurn();
+          requestAssistantIfIdle();
+        }
+      } else {
+        // If we have "some speech" and no assistant is answering, cut early to interleave
+        if (currentCallerBytes >= MIN_CALLER_BYTES && !awaitingAssistant) {
+          commitBufferedAudio();
+          if (materializeCallerTurn()) {
+            closeAssistantTurn();
+            requestAssistantIfIdle();
+          }
+        }
+      }
+    }, SLICE_POLL_MS);
+  }
+
+  function stopSlicer() {
+    if (slicerTimer) {
+      clearInterval(slicerTimer);
+      slicerTimer = null;
     }
   }
 
@@ -166,7 +223,7 @@ async function handleTwilio(ws, req) {
 
     oai.on("open", () => {
       oaiReady = true;
-      // Disable automatic turn detection (we orchestrate)
+      // We orchestrate the turns; omit auto turn detection
       oai.send(JSON.stringify({
         type: "session.update",
         session: {
@@ -174,7 +231,6 @@ async function handleTwilio(ws, req) {
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          // turn_detection omitted intentionally
           instructions: "You are a friendly but concise phone agent.",
         },
       }));
@@ -232,6 +288,7 @@ async function handleTwilio(ws, req) {
       const cp = msg.start?.customParameters || {};
       if (cp.prompt) prompt = cp.prompt.trim();
       ensureOpenAI();
+      startSlicer(); // begin periodic slicing guard
       return;
     }
 
@@ -241,50 +298,29 @@ async function handleTwilio(ws, req) {
       ulawChunks.push(chunk);
       totalBytes += chunk.length;
       currentCallerBytes += chunk.length;
+      lastCallerActivity = Date.now();
 
       if (oai && oaiReady) {
         oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
         hasBufferedAudio = true;
-
-        // reset debounce
-        if (commitTimer) clearTimeout(commitTimer);
-        commitTimer = setTimeout(() => {
-          try {
-            if (hasBufferedAudio) {
-              oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-              hasBufferedAudio = false;
-            }
-
-            const madeCallerTurn = createCallerTurnIfEnoughBytes();
-            if (madeCallerTurn) {
-              // finish any assistant turn that just spoke
-              closeAssistantTurn();
-              // trigger next assistant ONLY if not already answering
-              maybeTriggerAssistant();
-            }
-          } catch (err) {
-            console.error("Commit/send error:", err);
-          }
-        }, DEBOUNCE_MS);
+        scheduleDebounce(); // silence-based end-of-turn
       }
       return;
     }
 
     if (msg.event === "stop") {
-      // Do NOT start any new assistant responses past this point
-      // flush assistant turn if open
-      closeAssistantTurn();
+      stopped = true;
+      stopSlicer();
+      if (debounceTimer) clearTimeout(debounceTimer);
 
-      // finalize any in-flight caller audio
-      if (hasBufferedAudio && oai && oaiReady) {
-        try { oai.send(JSON.stringify({ type: "input_audio_buffer.commit" })); } catch {}
-        hasBufferedAudio = false;
-      }
-      createCallerTurnIfEnoughBytes();
+      // Flush and finalize any remaining caller audio
+      commitBufferedAudio();
+      materializeCallerTurn();
+      closeAssistantTurn();
 
       try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
 
-      // ==== Transcribe per caller turn by byte offsets ====
+      // ==== Per-turn transcription by byte offsets ====
       const callerTexts = [];
       const allUlaw = Buffer.concat(ulawChunks);
       for (let i = 0; i < callerTurns.length; i++) {
@@ -310,7 +346,7 @@ async function handleTwilio(ws, req) {
         callerTexts.push((tj.text || "").trim());
       }
 
-      // Build chronological transcript:
+      // ==== Build chronological transcript ====
       const chron = [];
       let callerIdx = 0;
       for (const t of turns) {
@@ -336,7 +372,6 @@ async function handleTwilio(ws, req) {
         .join("\n")
         .trim();
 
-      // Keep the summary, but it's independent of turn logic
       if (base.length > 30) {
         const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
@@ -428,6 +463,7 @@ function pcm16ToWav(pcm16, rate = 8000) {
   return buf;
 }
 
+// Clean whitespace (preserve \n)
 function normalizeTurnText(s) {
   return String(s || "")
     .replace(/\r\n?/g, "\n")
