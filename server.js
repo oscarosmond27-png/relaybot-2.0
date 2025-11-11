@@ -186,7 +186,7 @@ async function handleTwilio(ws, req) {
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
+          input_audio_transcription: { model: "gpt-4o-mini-transcribe", enabled: true },
           instructions: "You are a friendly but concise phone agent.",
         },
       }));
@@ -214,11 +214,12 @@ async function handleTwilio(ws, req) {
       if (t === "input_audio_transcription.delta" && msg.delta) {
         const text = msg.delta.trim();
         if (text && LIVE_TO_GROUPME) {
-          if (handleTwilio.lastCallerSent !== text) {
+          if (!handleTwilio.lastCallerSent || !text.startsWith(handleTwilio.lastCallerSent)) {
             handleTwilio.lastCallerSent = text;
             await sendGroupMe(`Caller: ${text}`);
           }
         }
+
         return;
       }
 
@@ -252,6 +253,10 @@ async function handleTwilio(ws, req) {
         closeAssistantTurn();
         awaitingAssistant = false;
       }
+      else {
+        console.log("⚙️ Unknown Realtime event:", t, msg);
+      }
+      
     });
   }
 
