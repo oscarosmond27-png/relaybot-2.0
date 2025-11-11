@@ -415,11 +415,20 @@ function explodeTurnsByNewlines(turns) {
   for (const t of turns) {
     const text = normalizeTurnText(t.text);
     if (!text) continue;
-    const lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
-    for (const line of lines) out.push({ role: t.role, text: line });
+
+    // Prefer explicit newlines if present (e.g., lists), otherwise split by sentences.
+    const hasNewlines = /\n/.test(text);
+    const parts = hasNewlines
+      ? text.split(/\n+/).map(x => x.trim()).filter(Boolean)
+      : splitIntoSentences(text); // falls back to sentence-level
+
+    for (const part of parts) {
+      if (part) out.push({ role: t.role, text: part });
+    }
   }
   return out;
 }
+
 
 function splitIntoSentences(text) {
   const s = String(text || '').trim();
