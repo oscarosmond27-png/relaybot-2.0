@@ -18,6 +18,30 @@ app.post("/groupme", async (req, res) => {
     }
 
     const text = (req.body?.text || "").trim();
+
+    // === Handle hang-up commands ===
+    if (/^(end|hang ?up|stop) call/i.test(text)) {
+      if (!global.currentTwilioCallSid) {
+        await sendGroupMe("No active call to end.");
+        return res.send("ok");
+      }
+      const sid = global.currentTwilioCallSid;
+      global.currentTwilioCallSid = null;
+    
+      const api = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls/${sid}.json`;
+      const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString("base64");
+    
+      await fetch(api, {
+        method: "POST",
+        headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ Status: "completed" }),
+      });
+    
+      await sendGroupMe("☎️ Call ended.");
+      return res.send("ok");
+    }
+
+    
     const senderType = req.body?.sender_type || "";
     if (senderType === "bot") return res.send("ok");
 
@@ -333,7 +357,15 @@ async function makeTwilioCallWithTwiml(to, promptText) {
     `<Parameter name="prompt" value="${safePrompt}"/><Parameter name="loop" value="0"/>` +
     `</Stream></Connect></Response>`;
   const body = new URLSearchParams({ To: to, From: process.env.TWILIO_FROM_NUMBER, Twiml: twiml });
-  return fetch(api, { method: "POST", headers: { Authorization: `Basic ${auth}` }, body });
+  const response = await fetch(api, { method: "POST", headers: { Authorization: `Basic ${auth}` }, body });
+  const data = await response.json();
+  
+  // Store the current call SID so we can end it later
+  if (data.sid) global.currentTwilioCallSid = data.sid;
+  
+  return response;
+
+  
 }
 
 async function sendGroupMe(text) {
