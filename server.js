@@ -184,10 +184,12 @@ async function handleTwilio(ws, req) {
         session: {
           voice: "ash",
           modalities: ["audio", "text"],
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
+          input_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
+          output_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
+
           input_audio_transcription: { model: "gpt-4o-mini-transcribe", enabled: true },
           instructions: "You are a friendly but concise phone agent.",
+          
         },
       }));
 
