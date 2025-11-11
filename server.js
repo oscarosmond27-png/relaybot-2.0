@@ -1,4 +1,4 @@
-// server.js — live GroupMe streaming + robust interleaving + per-turn transcription (cleaned)
+// server.js — uses GPT-4o's built-in realtime transcription + live GroupMe streaming
 import express from "express";
 import fetch, { FormData, Blob } from "node-fetch";
 import { WebSocketServer, WebSocket } from "ws";
@@ -63,17 +63,14 @@ app.get("/twiml", (req, res) => {
   const wsUrl = `wss://${host}/twilio`;
   const promptAttr = String(prompt).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 
-  // Stream only inbound (caller) audio to us — avoids assistant playback in Whisper
   const xml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
-    `<Response>` +
-    `<Connect>` +
+    `<Response><Connect>` +
     `<Stream url="${wsUrl}" track="inbound_track">` +
     `<Parameter name="prompt" value="${promptAttr}"/>` +
     `<Parameter name="loop" value="${loopFlag ? "1" : "0"}"/>` +
     `</Stream>` +
-    `</Connect>` +
-    `</Response>`;
+    `</Connect></Response>`;
 
   res.set("Content-Type", "text/xml").send(xml);
 });
@@ -95,116 +92,44 @@ async function handleTwilio(ws, req) {
   let prompt = "test";
   let streamSid = null;
   let started = false;
-
-  // Turn tracking
-  const turns = [];            // [{role:'assistant'|'caller', text?}]
-  const callerTurns = [];      // [{bytes, start, end}]
-  let totalBytes = 0;          // cumulative inbound μ-law bytes
-  let currentCallerBytes = 0;  // bytes since last caller turn
   let stopped = false;
 
-  // Audio buffers
-  let ulawChunks = [];
-  let recentCallerAudio = [];       // rolling μ-law buffer for live transcription
-  let lastLiveCallerText = "";      // what we’ve already posted
-  let liveWhisperTimer = null;      // polling timer
-  let hasBufferedAudio = false;
+  const turns = [];
+  const callerTurns = [];
+  let totalBytes = 0;
+  let currentCallerBytes = 0;
+  const DEBOUNCE_MS = 600;
+  const MIN_CALLER_BYTES = 2000;
+  const LIVE_TO_GROUPME = true;
 
-  // OpenAI Realtime
+  let ulawChunks = [];
   let oai = null;
   let oaiReady = false;
-
-  // Debounce / single-flight
   let debounceTimer = null;
   let awaitingAssistant = false;
 
-  // Tunables
-  const DEBOUNCE_MS = 600;     // silence window to end caller turn
-  const MIN_CALLER_BYTES = 2000; // ~0.25s @8kHz μ-law
-  const LIVE_TO_GROUPME = true; // flip to false if you want to disable live streaming
-
-  // Assistant text aggregation
   let currentAssistantText = "";
   let assistantTurnOpen = false;
   let assistantTranscript = "";
   let greeted = false;
-
-  // === Live streaming helpers ===
   let assistantLiveBuf = "";
 
   async function emitAssistantIfBoundary() {
     if (!LIVE_TO_GROUPME) return;
-  
-    // Emit on sentence end or when chunk gets long
     if (/[.!?]\s*$/.test(assistantLiveBuf) || assistantLiveBuf.length > 200) {
       const out = assistantLiveBuf.trim();
       assistantLiveBuf = "";
       if (!out) return;
-  
-      // ✅ Prevent duplicate repeats
       if (emitAssistantIfBoundary.lastSent === out) return;
       emitAssistantIfBoundary.lastSent = out;
-  
       await sendGroupMe(`Assistant: ${out}`);
     }
   }
-
   async function flushAssistantLive() {
-    if (!LIVE_TO_GROUPME) return;
     const out = assistantLiveBuf.trim();
     if (out) await sendGroupMe(`Assistant: ${out}`);
     assistantLiveBuf = "";
   }
-  async function transcribeRecentCallerLive() {
-    if (!LIVE_TO_GROUPME || recentCallerAudio.length < 500) return;
-  
-    // Merge the last ~5s of audio
-    const slice = Buffer.concat(recentCallerAudio);
-    const pcm16 = ulawToPcm16(slice);
-    const wav = pcm16ToWav(pcm16, 8000);
-  
-    const fd = new FormData();
-    fd.append("model", "whisper-1");
-    fd.append("file", new Blob([wav], { type: "audio/wav" }), "live.wav");
-    fd.append("temperature", "0");
-    fd.append("language", "en");
-    fd.append("response_format", "verbose_json");
-  
-    try {
-      const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-        body: fd,
-      });
-      const j = await r.json();
-      const cleaned = mergeWhisperSegmentsVerboseJson(j);
-  
-      // post only new increments
-      if (cleaned && cleaned !== lastLiveCallerText) {
-        const diff = cleaned.replace(lastLiveCallerText, "").trim();
-        if (diff) await sendGroupMe(`Caller: ${diff}`);
-        lastLiveCallerText = cleaned;
-      }
-    } catch (e) {
-      console.error("live whisper error:", e);
-    }
-  }
-  
-  function startLiveCallerStream() {
-    if (liveWhisperTimer) return;
-    liveWhisperTimer = setInterval(() => {
-      transcribeRecentCallerLive();
-    }, 2000); // every 2 seconds
-  }
-  
-  function stopLiveCallerStream() {
-    if (liveWhisperTimer) clearInterval(liveWhisperTimer);
-    liveWhisperTimer = null;
-    recentCallerAudio = [];
-    lastLiveCallerText = "";
-  }
-
-  
 
   function openAssistantTurn() {
     if (assistantTurnOpen) return;
@@ -216,79 +141,7 @@ async function handleTwilio(ws, req) {
     if (!assistantTurnOpen) return;
     assistantTurnOpen = false;
     const idx = turns.findIndex((t) => t.role === "assistant" && !t.text);
-    if (idx !== -1) turns[idx].text = (currentAssistantText || "").trim();
-  }
-
-  function materializeCallerTurn() {
-    if (currentCallerBytes < MIN_CALLER_BYTES) return false;
-    const start = totalBytes - currentCallerBytes;
-    const end = totalBytes;
-    turns.push({ role: "caller" });
-    callerTurns.push({ bytes: currentCallerBytes, start, end });
-
-    // LIVE: transcribe and push this caller slice right now (fire-and-forget)
-    transcribeAndSendCallerSlice(start, end).catch(e => console.error("live caller transcribe error:", e));
-
-    currentCallerBytes = 0;
-    return true;
-  }
-
-  function commitBufferedAudio() {
-    if (!oai || !oaiReady || !hasBufferedAudio) return;
-    try {
-      oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      hasBufferedAudio = false;
-    } catch (e) {
-      console.error("commit error:", e);
-    }
-  }
-
-  function scheduleDebounce() {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      commitBufferedAudio();
-      if (materializeCallerTurn()) {
-        closeAssistantTurn();
-        maybeTriggerAssistant();
-      }
-    }, DEBOUNCE_MS);
-  }
-
-  function maybeTriggerAssistant() {
-    if (!oai || !oaiReady || awaitingAssistant || stopped) return;
-    awaitingAssistant = true;
-    try {
-      oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio", "text"] } }));
-    } catch (e) {
-      awaitingAssistant = false;
-      console.error("response.create failed:", e);
-    }
-  }
-
-  async function transcribeAndSendCallerSlice(start, end) {
-    if (!LIVE_TO_GROUPME) return;
-    const allUlaw = Buffer.concat(ulawChunks);
-    const slice = allUlaw.subarray(start, end);
-    if (!slice || slice.length < 800) return; // skip tiny noise
-
-    const pcm16 = ulawToPcm16(slice);
-    const wav = pcm16ToWav(pcm16, 8000);
-
-    const fd = new FormData();
-    fd.append("model", "whisper-1");
-    fd.append("file", new Blob([wav], { type: "audio/wav" }), "live.wav");
-    fd.append("temperature", "0");
-    fd.append("language", "en");
-    fd.append("response_format", "verbose_json");
-
-    const tr = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      body: fd,
-    });
-    const tj = await tr.json();
-    const cleaned = mergeWhisperSegmentsVerboseJson(tj);
-    if (cleaned) await sendGroupMe(`Caller: ${cleaned}`);
+    if (idx !== -1) turns[idx].text = currentAssistantText.trim();
   }
 
   function ensureOpenAI() {
@@ -309,7 +162,7 @@ async function handleTwilio(ws, req) {
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          // no turn_detection; we orchestrate
+          input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
           instructions: "You are a friendly but concise phone agent.",
         },
       }));
@@ -328,10 +181,28 @@ async function handleTwilio(ws, req) {
       }
     });
 
-    // Realtime streaming: send assistant partials live
+    // === Handle Realtime events ===
     oai.on("message", async (data) => {
       let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
       const t = msg.type;
+
+      // --- Caller live transcription from model ---
+      if (t === "input_audio_transcription.delta" && msg.delta) {
+        const text = msg.delta.trim();
+        if (text && LIVE_TO_GROUPME) {
+          if (handleTwilio.lastCallerSent !== text) {
+            handleTwilio.lastCallerSent = text;
+            await sendGroupMe(`Caller: ${text}`);
+          }
+        }
+        return;
+      }
+
+      if (t === "input_audio_transcription.completed" && msg.text) {
+        const text = msg.text.trim();
+        if (text && LIVE_TO_GROUPME) await sendGroupMe(`Caller: ${text}`);
+        return;
+      }
 
       if (t === "response.created") { openAssistantTurn(); return; }
 
@@ -345,21 +216,17 @@ async function handleTwilio(ws, req) {
       if (t === "response.output_text.delta" && msg.delta) {
         assistantTranscript += msg.delta;
         if (assistantTurnOpen) currentAssistantText += msg.delta;
-      
-        // LIVE: buffer and emit when we hit a sentence boundary
         if (LIVE_TO_GROUPME) {
           assistantLiveBuf += msg.delta;
           await emitAssistantIfBoundary();
         }
         return;
       }
-      
 
       if (t === "response.completed" || t === "response.output_audio.done" || t === "response.error") {
-        await flushAssistantLive(); // flush any trailing chunk
+        await flushAssistantLive();
         closeAssistantTurn();
-        awaitingAssistant = false; // allow next assistant response
-        return;
+        awaitingAssistant = false;
       }
     });
   }
@@ -377,35 +244,18 @@ async function handleTwilio(ws, req) {
     }
 
     if (msg.event === "media" && streamSid) {
-      // inbound caller audio
       const chunk = Buffer.from(msg.media.payload, "base64");
       ulawChunks.push(chunk);
       totalBytes += chunk.length;
       currentCallerBytes += chunk.length;
 
-      // --- live caller rolling buffer (~5 s) ---
-      recentCallerAudio.push(chunk);
-      const MAX_LIVE_WINDOW = 40000; // about 5 s of μ-law @8 kHz
-      let liveLen = recentCallerAudio.reduce((a, b) => a + b.length, 0);
-      while (liveLen > MAX_LIVE_WINDOW && recentCallerAudio.length) {
-        liveLen -= recentCallerAudio.shift().length;
-      }
-      
-      // start live Whisper polling if not already
-      startLiveCallerStream();
-
-
       if (oai && oaiReady) {
         oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: msg.media.payload }));
-        hasBufferedAudio = true;
-        // debounce end-of-turn on silence
         if (debounceTimer) clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
-          commitBufferedAudio();
-          if (materializeCallerTurn()) {
-            closeAssistantTurn();
-            maybeTriggerAssistant();
-          }
+          try {
+            oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+          } catch {}
         }, DEBOUNCE_MS);
       }
       return;
@@ -413,73 +263,33 @@ async function handleTwilio(ws, req) {
 
     if (msg.event === "stop") {
       stopped = true;
-      stopLiveCallerStream(); // stop live polling and clear buffers
       if (debounceTimer) clearTimeout(debounceTimer);
-
-      // finalize any remaining caller audio
-      commitBufferedAudio();
-      materializeCallerTurn();
-
-      // flush assistant turn
-      await flushAssistantLive().catch(()=>{});
+      try { oai?.close(); } catch {}
+      await flushAssistantLive();
       closeAssistantTurn();
 
-      try { if (oai && oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
-
-      // Final transcript build (non-live, for completeness + summary)
-      // Transcribe each caller turn once more (cleanly) to ensure consistency
-      const callerTexts = [];
+      // still run end-of-call Whisper for final transcript + summary
       const allUlaw = Buffer.concat(ulawChunks);
-      for (let i = 0; i < callerTurns.length; i++) {
-        const { start, end } = callerTurns[i];
-        const slice = allUlaw.subarray(start, end);
-        if (!slice || slice.length < MIN_CALLER_BYTES / 2) {
-          callerTexts.push("");
-          continue;
-        }
-        const pcm16 = ulawToPcm16(slice);
-        const wav = pcm16ToWav(pcm16, 8000);
-        const fd = new FormData();
-        fd.append("model", "whisper-1");
-        fd.append("file", new Blob([wav], { type: "audio/wav" }), `turn_${i}.wav`);
-        fd.append("temperature", "0");
-        fd.append("language", "en");
-        fd.append("response_format", "verbose_json");
-        const tr = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-          body: fd,
-        });
-        const tj = await tr.json();
-        const cleaned = mergeWhisperSegmentsVerboseJson(tj);
-        callerTexts.push(cleaned);
-      }
+      const fd = new FormData();
+      fd.append("model", "whisper-1");
+      fd.append("file", new Blob([pcm16ToWav(ulawToPcm16(allUlaw), 8000)], { type: "audio/wav" }), "call.wav");
+      const tr = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+        body: fd,
+      });
+      const tj = await tr.json();
+      const callerTranscript = (tj.text || "").trim();
 
-      // Chronological transcript (assistant split smartly; caller 1:1)
-      const chron = [];
-      let callerIdx = 0;
-      for (const t of turns) {
-        if (t.role === "assistant") {
-          const exploded = explodeTurnsSmart([t]);
-          for (const e of exploded) if (e.text) chron.push(e);
-        } else {
-          const txt = normalizeTurnText(callerTexts[callerIdx++] || "");
-          if (!txt) continue;
-          const lines = txt.split(/\n+/).map(x => x.trim()).filter(Boolean);
-          for (const line of lines) chron.push({ role: "caller", text: line });
-        }
-      }
+      const labeled = [
+        "🗣️ Transcript",
+        `Caller: ${callerTranscript}`,
+        `Assistant: ${assistantTranscript.trim()}`,
+      ].join("\n");
+      await sendGroupMe(labeled);
 
-      const labeled = chron
-        .map((t) => `${t.role === "assistant" ? "Assistant" : "Caller"}: ${t.text}`)
-        .join("\n");
-      await sendGroupMe(`🗣️ Transcript\n${labeled}`);
-
-      const base = chron
-        .map((t) => `${t.role === "assistant" ? "Assistant" : "Caller"}: ${t.text}`)
-        .join("\n")
-        .trim();
-      if (base.length > 30) {
+      if (callerTranscript.length > 30 || assistantTranscript.length > 30) {
+        const base = `Caller: ${callerTranscript}\nAssistant: ${assistantTranscript}`;
         const summaryResponse = await fetch("https://api.openai.com/v1/chat/completions", {
           method: "POST",
           headers: {
@@ -568,59 +378,4 @@ function pcm16ToWav(pcm16, rate = 8000) {
   buf.writeUInt32LE(dataSize, 40);
   for (let i = 0; i < pcm16.length; i++) buf.writeInt16LE(pcm16[i], 44 + i * 2);
   return buf;
-}
-
-// === Whisper cleaning helpers ===
-function cleanCallerText(raw) {
-  let t = String(raw || "").trim();
-  t = t.replace(/\b(\w+)(\s+\1\b){1,}/gi, "$1");                 // "you you" -> "you"
-  t = t.replace(/\b(\w+\s+\w+)(\s+\1\b){1,}/gi, "$1");            // 2-word repeat
-  t = t.replace(/\b(\w+\s+\w+\s+\w+)(\s+\1\b){1,}/gi, "$1");      // 3-word repeat
-  t = t.replace(/subscribe only the human caller.*?(audio\.)?/i, "");
-  t = t.replace(/\s+/g, " ").trim();
-  return t;
-}
-function mergeWhisperSegmentsVerboseJson(json) {
-  if (!json || !json.segments) return (json?.text || "").trim();
-  const kept = json.segments.filter(seg => {
-    const dur = Math.max(0, (seg.end || 0) - (seg.start || 0));
-    const text = (seg.text || "").trim();
-    if (!text) return false;
-    if (seg.no_speech_prob !== undefined && seg.no_speech_prob > 0.6) return false;
-    if (seg.avg_logprob !== undefined && seg.avg_logprob < -1.0) return false;
-    if (dur < 0.45 && text.split(/\s+/).length <= 1) return false;
-    return true;
-  });
-  let out = kept.map(s => s.text.trim()).join(" ");
-  return cleanCallerText(out);
-}
-
-// === Text splitting/formatting ===
-function normalizeTurnText(s) {
-  return String(s || "")
-    .replace(/\r\n?/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .trim();
-}
-function explodeTurnsSmart(turns) {
-  const out = [];
-  for (const t of turns) {
-    const text = normalizeTurnText(t.text);
-    if (!text) continue;
-
-    const hasNewlines = /\n/.test(text);
-    const parts = hasNewlines
-      ? text.split(/\n+/).map(x => x.trim()).filter(Boolean)
-      : splitIntoSentences(text);
-
-    for (const part of parts) {
-      if (part) out.push({ role: t.role, text: part });
-    }
-  }
-  return out;
-}
-function splitIntoSentences(text) {
-  const s = String(text || '').trim();
-  if (!s) return [];
-  return (s.match(/[^.!?\n]+[.!?]?/g) || [s]).map((x) => x.trim()).filter(Boolean);
 }
