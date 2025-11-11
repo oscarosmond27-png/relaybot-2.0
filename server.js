@@ -336,7 +336,6 @@ async function handleTwilio(ws, req) {
         fd.append("model", "whisper-1");
         fd.append("file", new Blob([wav], { type: "audio/wav" }), `turn_${i}.wav`);
         fd.append("temperature", "0");
-        fd.append("prompt", "Transcribe only the human caller's speech, ignore any assistant playback audio.");
         const tr = await fetch("https://api.openai.com/v1/audio/transcriptions", {
           method: "POST",
           headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
