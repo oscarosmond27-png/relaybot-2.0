@@ -204,7 +204,47 @@ async function handleTwilio(ws, req) {
       const t = msg.type;
       const isAudio =
         t === "response.audio.delta" || t === "response.output_audio.delta";
-  
+
+
+      // --- transcript buffers (must persist inside handler) ---
+      if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
+      if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
+      
+      // === ASSISTANT AUDIO TRANSCRIPT (sentence buffering) ===
+      if (t === "response.audio_transcript.delta" && msg.delta) {
+        globalThis._assistantBuffer += msg.delta;
+      
+        // If delta ends with punctuation, treat as sentence end
+        if (/[.!?"]$/.test(msg.delta.trim())) {
+          const fullSentence = globalThis._assistantBuffer.trim();
+          const line = `Assistant: ${fullSentence}`;
+          transcriptText += `\n${line}`;
+          console.log("CAPTION:", line);
+      
+          globalThis._assistantBuffer = ""; // reset
+        }
+      }
+      
+      // === CALLER TRANSCRIPT (only completed events, deduped) ===
+      if (
+        t === "conversation.item.input_audio_transcription.completed" &&
+        msg.transcript
+      ) {
+        if (globalThis._callerLastItemId !== msg.item_id) {
+          globalThis._callerLastItemId = msg.item_id;
+      
+          const line = `Caller: ${msg.transcript.trim()}`;
+          transcriptText += `\n${line}`;
+          console.log("CAPTION:", line);
+        }
+      }
+
+      
+
+
+
+
+      
       // Forward assistant audio back to Twilio
       if (isAudio && msg.delta && streamSid) {
         if (ws.readyState === WebSocket.OPEN) {
@@ -218,27 +258,11 @@ async function handleTwilio(ws, req) {
         }
       }
   
-      // Assistant speech transcript
-      if (t === "response.audio_transcript.delta" && msg.delta) {
-        const line = `Assistant: ${msg.delta}`;
-        transcriptText += `\n${line}`;
-        console.log("CAPTION:", line);
-      }
+
+
 
       
-      // Caller partial transcription (live deltas)
-      if (t === "conversation.item.input_audio_transcription.delta" && msg.delta) {
-        const line = `Caller: ${msg.delta}`;
-        transcriptText += `\n${line}`;
-        console.log("CAPTION:", line);
-      }
-      
-      // Caller final transcription (cleaned + complete)
-      if (t === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
-        const line = `Caller: ${msg.transcript}`;
-        transcriptText += `\n${line}`;
-        console.log("CAPTION:", line);
-      }
+
     });
   
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
