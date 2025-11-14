@@ -231,62 +231,48 @@ oai.on("message", (data) => {
     }
   }
 
-// ====== CALLER TRANSCRIPT + BARGE-IN (only on real phrases) ======
-if (
-  t === "conversation.item.input_audio_transcription.completed" &&
-  msg.transcript
-) {
-  if (globalThis._callerLastItemId !== msg.item_id) {
-    globalThis._callerLastItemId = msg.item_id;
+// ====== CALLER TRANSCRIPT + SAFE BARGE-IN ======
+if (t === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
+  const callerText = msg.transcript.trim();
+  const words = callerText.split(/\s+/).filter(Boolean);
 
-    const callerText = msg.transcript.trim();
-    console.log("WHISPER COMPLETED:", callerText);
+  // Must be real speech: at least 1 real word or 2 short words, adjust as needed
+  if (words.length < 1) return;
+  if (callerText.length < 3) return;
 
-    // Optional: log what Whisper thinks it heard
-    // console.log("WHISPER COMPLETED:", callerText);
+  // Don't double-process same utterance
+  if (globalThis._callerLastItemId === msg.item_id) return;
+  globalThis._callerLastItemId = msg.item_id;
 
-    // Require:
-    //  - at least 8 characters
-    //  - and at least 2 words
-    const words = callerText.split(/\s+/).filter(Boolean);
-    if (callerText.length < 8 || words.length < 2) {
-      // too short / not really a phrase -> don't barge in
-      return;
-    }
+  // Log it
+  transcriptEntries.push({
+    speaker: "Caller",
+    text: callerText,
+    time: Date.now(),
+    seq: sequenceCounter++,
+  });
 
-    transcriptEntries.push({
-      speaker: "Caller",
-      text: callerText,
-      time: Date.now(),
-      seq: sequenceCounter++,
-    });
+  sendGroupMeBatched("Caller", callerText);
 
-    sendGroupMeBatched("Caller", callerText);
+  // 🔥 REAL BARGE-IN TRIGGER
+  allowAssistantAudio = false;
 
-    // 🔥 REAL BARGE-IN: user actually said a short sentence
-    allowAssistantAudio = false;
+  // Stop Twilio playback
+  if (ws.readyState === WebSocket.OPEN && streamSid) {
+    ws.send(JSON.stringify({ event: "clear", streamSid }));
+  }
 
-    // Tell Twilio to drop any queued, not-yet-played assistant audio
-    if (ws.readyState === WebSocket.OPEN && streamSid) {
-      ws.send(
-        JSON.stringify({
-          event: "clear",
-          streamSid,
-        })
-      );
-    }
-
-    // Cancel the current in-progress response on OpenAI side
-    if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
-      oai.send(
-        JSON.stringify({
-          type: "response.cancel",
-          response_id: currentResponseId,
-        })
-      );
-    }
+  // Stop OpenAI assistant speech
+  if (currentResponseId && oai.readyState === WebSocket.OPEN) {
+    oai.send(
+      JSON.stringify({
+        type: "response.cancel",
+        response_id: currentResponseId,
+      })
+    );
   }
 }
+
 
 
 
