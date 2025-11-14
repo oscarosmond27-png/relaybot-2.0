@@ -189,10 +189,12 @@ async function handleTwilio(ws, req) {
           type: "response.create",
           response: {
             modalities: ["audio", "text"],
+            output_audio_transcription: { enable: true },   // << REQUIRED
             instructions: `Start the call by saying: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: " Then clearly deliver this message: "${prompt}". Speak warmly but professionally, like a real assistant making a quick call. After finishing, pause to allow the person to respond. Remember that you are not an AI, you are a person who was hired to make calls. DO NOT REVEAL THAT YOU ARE AN AI.`,
           },
         })
       );
+
     });
   
     oai.on("message", (data) => {
@@ -202,59 +204,62 @@ async function handleTwilio(ws, req) {
       } catch {
         return;
       }
-  
+    
       const t = msg.type;
       const isAudio =
         t === "response.audio.delta" || t === "response.output_audio.delta";
-
-
+    
       // --- transcript buffers ---
       if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
       if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
-      
+    
       // === ASSISTANT TRANSCRIPT (buffered into sentences) ===
       if (t === "response.audio_transcript.delta" && msg.delta) {
         globalThis._assistantBuffer += msg.delta;
-      
+    
         if (/[.!?"]$/.test(msg.delta.trim())) {
           const sentence = globalThis._assistantBuffer.trim();
-      
+    
           transcriptEntries.push({
             speaker: "Assistant",
             text: sentence,
             time: Date.now(),
             seq: sequenceCounter++,
           });
-      
+    
+          console.log("CAPTION (Assistant):", sentence);
           globalThis._assistantBuffer = "";
         }
       }
-      
-      // === CALLER TRANSCRIPT (completed only, deduped) ===
+    
+      // === CALLER TRANSCRIPT — LIVE DELTA (required for Whisper) ===
+      if (
+        t === "conversation.item.input_audio_transcription.delta" &&
+        msg.delta
+      ) {
+        console.log("CALLER LIVE:", msg.delta);
+      }
+    
+      // === CALLER TRANSCRIPT — COMPLETED (deduped) ===
       if (
         t === "conversation.item.input_audio_transcription.completed" &&
         msg.transcript
       ) {
         if (globalThis._callerLastItemId !== msg.item_id) {
           globalThis._callerLastItemId = msg.item_id;
-      
+    
           transcriptEntries.push({
             speaker: "Caller",
             text: msg.transcript.trim(),
             time: Date.now(),
             seq: sequenceCounter++,
           });
+    
+          console.log("CAPTION (Caller):", msg.transcript.trim());
         }
       }
-
-
-      
-
-
-
-
-      
-      // Forward assistant audio back to Twilio
+    
+      // === FORWARD ASSISTANT AUDIO TO TWILIO ===
       if (isAudio && msg.delta && streamSid) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
@@ -266,13 +271,8 @@ async function handleTwilio(ws, req) {
           );
         }
       }
-  
-
-
-
-      
-
     });
+
   
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
     oai.on("close", () => console.log("OpenAI socket closed"));
