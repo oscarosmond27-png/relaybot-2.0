@@ -136,6 +136,7 @@ async function handleTwilio(ws, req) {
   let oai = null;
   let oaiReady = false;
   let commitTimer = null;
+  let allowAssistantAudio = true; // <- controls barge-in: whether Twilio is allowed to play assistant audio
 
   const DEBOUNCE_MS = 700;
 
@@ -194,17 +195,33 @@ oai.on("open", () => {
       const t = msg.type;
       const isAudio =
         t === "response.audio.delta" || t === "response.output_audio.delta";
+
+
+      // === BARDE-IN: caller started talking, cut assistant audio ===
+      if (
+        t === "conversation.item.input_audio_transcription.delta" &&
+        msg.delta
+      ) {
+        allowAssistantAudio = false;
+      }
+
+      
     
       // --- transcript buffers ---
       if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
       if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
     
       // === ASSISTANT TRANSCRIPT (buffered into sentences) ===
+
+      
       if (t === "response.audio_transcript.delta" && msg.delta) {
         globalThis._assistantBuffer += msg.delta;
     
         if (/[.!?"]$/.test(msg.delta.trim())) {
           const sentence = globalThis._assistantBuffer.trim();
+
+          // New assistant turn -> allow audio again
+          allowAssistantAudio = true;
     
           transcriptEntries.push({
             speaker: "Assistant",
@@ -215,14 +232,18 @@ oai.on("open", () => {
     
           setTimeout(() => {
             sendGroupMeBatched("Assistant", sentence);
-          }, 500);
-
-
+          }, 1000);
 
           globalThis._assistantBuffer = "";
         }
       }
-    
+
+
+
+
+
+
+      
       // === CALLER TRANSCRIPT — COMPLETED (deduped) ===
       if (
         t === "conversation.item.input_audio_transcription.completed" &&
@@ -230,6 +251,9 @@ oai.on("open", () => {
       ) {
         if (globalThis._callerLastItemId !== msg.item_id) {
           globalThis._callerLastItemId = msg.item_id;
+
+          // Caller spoke -> make sure assistant audio is off for this turn
+          allowAssistantAudio = false;
     
           transcriptEntries.push({
             speaker: "Caller",
@@ -243,8 +267,8 @@ oai.on("open", () => {
         }
       }
     
-      // === FORWARD ASSISTANT AUDIO TO TWILIO ===
-      if (isAudio && msg.delta && streamSid) {
+      // === FORWARD ASSISTANT AUDIO TO TWILIO (with barge-in gating) ===
+      if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
             JSON.stringify({
@@ -255,6 +279,10 @@ oai.on("open", () => {
           );
         }
       }
+
+
+
+      
     });
 
   
