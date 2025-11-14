@@ -367,7 +367,9 @@ oai.on("open", () => {
           .map((e) => `${e.speaker}: ${e.text}`)
           .join("\n");
 
-
+          // 🔹 NEW: send full transcript to GroupMe
+          await sendGroupMe(`📄 Full transcript:\n${transcript}`);
+        
         if (transcript.length < 30) {
           await sendGroupMe("📝 Call summary: No usable transcript captured.");
           try {
