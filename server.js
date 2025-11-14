@@ -137,6 +137,7 @@ async function handleTwilio(ws, req) {
   let oaiReady = false;
   let commitTimer = null;
   let allowAssistantAudio = true; // <- controls barge-in: whether Twilio is allowed to play assistant audio
+  let currentResponseId = null; // NEW
 
   const DEBOUNCE_MS = 700;
 
@@ -197,18 +198,44 @@ oai.on("open", () => {
         t === "response.audio.delta" || t === "response.output_audio.delta";
 
       // ========== BARGE-IN LOGIC ==========
-      // Caller starts talking (OpenAI VAD fires) -> stop sending assistant audio
-      if (t === "input_audio_buffer.speech_started") {
-        // Caller is now speaking; don't forward further assistant audio to Twilio
-        allowAssistantAudio = false;
-      }
 
-      // New assistant response created -> allow assistant audio again
+      // 1) New assistant response created -> store response_id and allow audio
       if (t === "response.created") {
+        currentResponseId = msg.response?.id || null;
         allowAssistantAudio = true;
       }
 
+      // 2) Caller starts talking -> cut assistant audio + flush Twilio buffer + cancel response
+      if (
+        t === "input_audio_buffer.speech_started" ||
+        (t === "conversation.item.input_audio_transcription.delta" && msg.delta)
+      ) {
+        // Stop forwarding further assistant audio
+        allowAssistantAudio = false;
+
+        // Ask Twilio to drop any queued media it hasn't played yet
+        if (ws.readyState === WebSocket.OPEN && streamSid) {
+          ws.send(
+            JSON.stringify({
+              event: "clear",
+              streamSid,
+            })
+          );
+        }
+
+        // Cancel the current in-progress assistant response on OpenAI
+        if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
+          oai.send(
+            JSON.stringify({
+              type: "response.cancel",
+              response_id: currentResponseId,
+            })
+          );
+        }
+      }
+
       // ========== CAPTIONS / TRANSCRIPT ==========
+
       if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
       if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
 
@@ -226,7 +253,7 @@ oai.on("open", () => {
             seq: sequenceCounter++,
           });
 
-          // Send a little later so caller captions tend to arrive first
+          // Delay a bit so caller captions can arrive first
           setTimeout(() => {
             sendGroupMeBatched("Assistant", sentence);
           }, 1000);
@@ -267,6 +294,7 @@ oai.on("open", () => {
         }
       }
     });
+
 
 
   
