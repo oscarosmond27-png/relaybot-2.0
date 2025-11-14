@@ -232,14 +232,6 @@ async function handleTwilio(ws, req) {
         }
       }
     
-      // === CALLER TRANSCRIPT — LIVE DELTA (required for Whisper) ===
-      if (
-        t === "conversation.item.input_audio_transcription.delta" &&
-        msg.delta
-      ) {
-        console.log("CALLER LIVE:", msg.delta);
-      }
-    
       // === CALLER TRANSCRIPT — COMPLETED (deduped) ===
       if (
         t === "conversation.item.input_audio_transcription.completed" &&
