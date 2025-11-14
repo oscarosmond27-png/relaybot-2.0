@@ -191,45 +191,42 @@ oai.on("open", () => {
       } catch {
         return;
       }
-    
+
       const t = msg.type;
       const isAudio =
         t === "response.audio.delta" || t === "response.output_audio.delta";
 
-
-      // === BARDE-IN: caller started talking, cut assistant audio ===
-      if (
-        t === "conversation.item.input_audio_transcription.delta" &&
-        msg.delta
-      ) {
+      // ========== BARGE-IN LOGIC ==========
+      // Caller starts talking (OpenAI VAD fires) -> stop sending assistant audio
+      if (t === "input_audio_buffer.speech_started") {
+        // Caller is now speaking; don't forward further assistant audio to Twilio
         allowAssistantAudio = false;
       }
 
-      
-    
-      // --- transcript buffers ---
+      // New assistant response created -> allow assistant audio again
+      if (t === "response.created") {
+        allowAssistantAudio = true;
+      }
+
+      // ========== CAPTIONS / TRANSCRIPT ==========
       if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
       if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
-    
-      // === ASSISTANT TRANSCRIPT (buffered into sentences) ===
 
-      
+      // --- Assistant transcript, buffered into sentences ---
       if (t === "response.audio_transcript.delta" && msg.delta) {
         globalThis._assistantBuffer += msg.delta;
-    
+
         if (/[.!?"]$/.test(msg.delta.trim())) {
           const sentence = globalThis._assistantBuffer.trim();
 
-          // New assistant turn -> allow audio again
-          allowAssistantAudio = true;
-    
           transcriptEntries.push({
             speaker: "Assistant",
             text: sentence,
             time: Date.now(),
             seq: sequenceCounter++,
           });
-    
+
+          // Send a little later so caller captions tend to arrive first
           setTimeout(() => {
             sendGroupMeBatched("Assistant", sentence);
           }, 1000);
@@ -238,13 +235,7 @@ oai.on("open", () => {
         }
       }
 
-
-
-
-
-
-      
-      // === CALLER TRANSCRIPT — COMPLETED (deduped) ===
+      // --- Caller transcript (completed turns, deduped) ---
       if (
         t === "conversation.item.input_audio_transcription.completed" &&
         msg.transcript
@@ -252,22 +243,18 @@ oai.on("open", () => {
         if (globalThis._callerLastItemId !== msg.item_id) {
           globalThis._callerLastItemId = msg.item_id;
 
-          // Caller spoke -> make sure assistant audio is off for this turn
-          allowAssistantAudio = false;
-    
           transcriptEntries.push({
             speaker: "Caller",
             text: msg.transcript.trim(),
             time: Date.now(),
             seq: sequenceCounter++,
           });
-    
-          sendGroupMeBatched("Caller", msg.transcript.trim());
 
+          sendGroupMeBatched("Caller", msg.transcript.trim());
         }
       }
-    
-      // === FORWARD ASSISTANT AUDIO TO TWILIO (with barge-in gating) ===
+
+      // ========== FORWARD ASSISTANT AUDIO TO TWILIO (with barge-in gating) ==========
       if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
@@ -279,11 +266,8 @@ oai.on("open", () => {
           );
         }
       }
-
-
-
-      
     });
+
 
   
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
