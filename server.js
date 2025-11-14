@@ -229,7 +229,7 @@ oai.on("message", (data) => {
     }
   }
 
-// ====== CALLER TRANSCRIPT + BARGE-IN (on REAL utterance) ======
+// ====== CALLER TRANSCRIPT + BARGE-IN (only on real phrases) ======
 if (
   t === "conversation.item.input_audio_transcription.completed" &&
   msg.transcript
@@ -239,9 +239,15 @@ if (
 
     const callerText = msg.transcript.trim();
 
-    // 🔍 Ignore tiny/noisy "utterances" so we don't false-barge
-    if (callerText.length < 5) {
-      // e.g. "uh", "ok", noise, etc. -> don't cancel the bot for this
+    // Optional: log what Whisper thinks it heard
+    // console.log("WHISPER COMPLETED:", callerText);
+
+    // Require:
+    //  - at least 8 characters
+    //  - and at least 2 words
+    const words = callerText.split(/\s+/).filter(Boolean);
+    if (callerText.length < 8 || words.length < 2) {
+      // too short / not really a phrase -> don't barge in
       return;
     }
 
@@ -257,6 +263,7 @@ if (
     // 🔥 REAL BARGE-IN: user actually said a short sentence
     allowAssistantAudio = false;
 
+    // Tell Twilio to drop any queued, not-yet-played assistant audio
     if (ws.readyState === WebSocket.OPEN && streamSid) {
       ws.send(
         JSON.stringify({
@@ -266,6 +273,7 @@ if (
       );
     }
 
+    // Cancel the current in-progress response on OpenAI side
     if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
       oai.send(
         JSON.stringify({
@@ -276,6 +284,7 @@ if (
     }
   }
 }
+
 
 
   // ====== FORWARD ASSISTANT AUDIO TO TWILIO (gated) ======
