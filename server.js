@@ -80,15 +80,16 @@ app.get("/twiml", (req, res) => {
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;");
 
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
-  <Response>
-    <Connect>
-      <Stream url="${wsUrl}" track="inbound">
-        <Parameter name="prompt" value="${promptAttr}"/>
-        <Parameter name="loop" value="${loopFlag ? "1" : "0"}"/>
-      </Stream>
-    </Connect>
-  </Response>`;
+const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}">
+      <Parameter name="prompt" value="${promptAttr}"/>
+      <Parameter name="loop" value="${loopFlag ? "1" : "0"}"/>
+    </Stream>
+  </Connect>
+</Response>`;
+
 
 
   res.set("Content-Type", "text/xml").send(xml);
@@ -579,14 +580,14 @@ async function makeTwilioCallWithTwiml(to, promptText) {
 
   const streamUrl = `wss://${process.env.BASE_HOST || "relaybot-2-0.onrender.com"}/twilio`;
 
-  const twiml =
-    `<?xml version="1.0" encoding="UTF-8"?>` +
-    `<Response>` +
-    `<Connect><Stream url="${streamUrl}" track="inbound">` +
-    `<Parameter name="prompt" value="${safePrompt}"/>` +
-    `<Parameter name="loop" value="0"/>` +
-    `</Stream></Connect>` +
-    `</Response>`;
+const twiml =
+  `<?xml version="1.0" encoding="UTF-8"?>` +
+  `<Response>` +
+  `<Connect><Stream url="${streamUrl}">` +
+  `<Parameter name="prompt" value="${safePrompt}"/>` +
+  `<Parameter name="loop" value="0"/>` +
+  `</Stream></Connect>` +
+  `</Response>`;
 
 
   const body = new URLSearchParams({
