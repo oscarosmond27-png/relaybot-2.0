@@ -139,12 +139,12 @@ async function handleTwilio(ws, req) {
 
   function ensureOpenAI() {
     if (oai) return;
-
+  
     if (!process.env.OPENAI_API_KEY) {
       console.error("Missing OPENAI_API_KEY env var");
       return;
     }
-
+  
     oai = new WebSocket(
       "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview",
       "realtime",
@@ -155,11 +155,11 @@ async function handleTwilio(ws, req) {
         },
       }
     );
-
+  
     oai.on("open", () => {
       oaiReady = true;
-    
-      // Configure session
+  
+      // Configure session (now with input transcription)
       oai.send(
         JSON.stringify({
           type: "session.update",
@@ -171,17 +171,17 @@ async function handleTwilio(ws, req) {
             turn_detection: { type: "server_vad" },
             instructions:
               "You are a friendly but concise phone agent. Speak in clear American English. Keep calls under 2 minutes.",
-    
-            // 🔹 NEW: ask the session to transcribe incoming audio
+  
+            // 🔹 Option A: transcribe incoming audio too
             input_audio_transcription: {
-              model: "gpt-4o-transcribe", // or "whisper-1" depending on what you prefer
-              language: "en",             // optional but recommended
+              model: "whisper-1", // or another transcription-capable model
+              language: "en",
             },
           },
         })
       );
-    
-      // Initial response...
+  
+      // Initial response: say the prompt
       oai.send(
         JSON.stringify({
           type: "response.create",
@@ -192,8 +192,7 @@ async function handleTwilio(ws, req) {
         })
       );
     });
-
-
+  
     oai.on("message", (data) => {
       let msg;
       try {
@@ -201,12 +200,12 @@ async function handleTwilio(ws, req) {
       } catch {
         return;
       }
-
+  
       const t = msg.type;
       const isAudio =
         t === "response.audio.delta" || t === "response.output_audio.delta";
-
-      // Forward audio back to Twilio
+  
+      // Forward assistant audio back to Twilio
       if (isAudio && msg.delta && streamSid) {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(
@@ -218,31 +217,28 @@ async function handleTwilio(ws, req) {
           );
         }
       }
-
-      // Capture transcript deltas (spoken text)
+  
+      // Assistant speech transcript
       if (t === "response.audio_transcript.delta" && msg.delta) {
-        transcriptText += `\nAssistant: ${msg.delta}`;
-        console.log("CAPTION:", `Assistant: ${msg.delta}`);
+        transcriptText += msg.delta;
+      }
+  
+      // 🔹 NEW: just LOG user transcription events for now (no other behavior)
+      if (
+        t === "conversation.item.input_audio_transcription.delta" ||
+        t === "conversation.item.input_audio_transcription.completed"
+      ) {
+        console.log(
+          "USER TRANSCRIPTION EVENT:",
+          JSON.stringify(msg, null, 2)
+        );
       }
     });
-
-    // 🔹 NEW: log any input audio transcription events (caller speech)
-    if (
-      t === "conversation.item.input_audio_transcription.delta" ||
-      t === "conversation.item.input_audio_transcription.completed"
-    ) {
-      console.log(
-        "USER TRANSCRIPTION EVENT:",
-        JSON.stringify(msg, null, 2)
-      );
-    }
-
-    
-    
-
+  
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
     oai.on("close", () => console.log("OpenAI socket closed"));
   }
+
 
   ws.on("message", async (buf) => {
     let msg;
