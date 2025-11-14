@@ -220,18 +220,24 @@ async function handleTwilio(ws, req) {
   
       // Assistant speech transcript
       if (t === "response.audio_transcript.delta" && msg.delta) {
-        transcriptText += msg.delta;
+        const line = `Assistant: ${msg.delta}`;
+        transcriptText += `\n${line}`;
+        console.log("CAPTION:", line);
       }
-  
-      // 🔹 NEW: just LOG user transcription events for now (no other behavior)
-      if (
-        t === "conversation.item.input_audio_transcription.delta" ||
-        t === "conversation.item.input_audio_transcription.completed"
-      ) {
-        console.log(
-          "USER TRANSCRIPTION EVENT:",
-          JSON.stringify(msg, null, 2)
-        );
+
+      
+      // Caller partial transcription (live deltas)
+      if (t === "conversation.item.input_audio_transcription.delta" && msg.delta) {
+        const line = `Caller: ${msg.delta}`;
+        transcriptText += `\n${line}`;
+        console.log("CAPTION:", line);
+      }
+      
+      // Caller final transcription (cleaned + complete)
+      if (t === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
+        const line = `Caller: ${msg.transcript}`;
+        transcriptText += `\n${line}`;
+        console.log("CAPTION:", line);
       }
     });
   
