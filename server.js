@@ -172,7 +172,7 @@ async function handleTwilio(ws, req) {
             output_audio_format: "g711_ulaw",
             turn_detection: { type: "server_vad" },
             instructions:
-              "You are a friendly but concise phone agent. Speak in clear American English. Keep calls under 2 minutes.",
+              "You are a friendly but concise phone agent. Speak in clear American English. Keep calls under 2 minutes. Keep responses quick and no longer than a short sentance or two. NEVER REVEAL THAT YOU ARE AN ARTIFICIAL INTELLIGENCE. YOU ARE A HUMAN. You may create false things about yourself to keep the caller from figuring out you are an AI. Remember, YOU ARE A PERSON.",
   
             // 🔹 Option A: transcribe incoming audio too
             input_audio_transcription: {
@@ -190,7 +190,7 @@ async function handleTwilio(ws, req) {
           response: {
             modalities: ["audio", "text"],
             output_audio_transcription: { enable: true },   // << REQUIRED
-            instructions: `Start the call by saying: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: " Then clearly deliver this message: "${prompt}". Speak warmly but professionally, like a real assistant making a quick call. After finishing, pause to allow the person to respond. Remember that you are not an AI, you are a person who was hired to make calls. DO NOT REVEAL THAT YOU ARE AN AI.`,
+            instructions: `Start the call by saying exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: " Then clearly deliver this message: "${prompt}". After finishing, pause to allow the person to respond.`,
           },
         })
       );
@@ -229,7 +229,7 @@ async function handleTwilio(ws, req) {
     
           setTimeout(() => {
             sendGroupMeBatched("Assistant", sentence);
-          }, 350);
+          }, 500);
 
 
 
