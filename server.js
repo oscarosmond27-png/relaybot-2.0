@@ -228,8 +228,8 @@ async function handleTwilio(ws, req) {
           });
     
           setTimeout(() => {
-            console.log("CAPTION (Assistant):", sentence);
-          }, 350);   // delay ~150ms to let caller transcript catch up
+            sendCaptionToGPT("Assistant", sentence);
+          }, 350);
 
           globalThis._assistantBuffer = "";
         }
@@ -250,7 +250,7 @@ async function handleTwilio(ws, req) {
             seq: sequenceCounter++,
           });
     
-          console.log("CAPTION (Caller):", msg.transcript.trim());
+          sendCaptionToGPT("Caller", msg.transcript.trim());
         }
       }
     
@@ -442,6 +442,36 @@ async function handleTwilio(ws, req) {
 }
 
 // === Helper functions ===
+
+async function sendCaptionToGPT(role, text) {
+  try {
+    await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: "You receive caller and assistant captions in real time."
+          },
+          {
+            role: "user",
+            content: `${role}: ${text}`
+          }
+        ]
+      })
+    });
+  } catch (err) {
+    console.error("GPT caption forward error:", err);
+  }
+}
+
+
+
 function normalizePhone(s) {
   const digits = s.replace(/\D/g, "");
 
