@@ -185,115 +185,104 @@ oai.on("open", () => {
 
 
   
-    oai.on("message", (data) => {
-      let msg;
-      try {
-        msg = JSON.parse(data.toString());
-      } catch {
-        return;
+oai.on("message", (data) => {
+  let msg;
+  try {
+    msg = JSON.parse(data.toString());
+  } catch {
+    return;
+  }
+
+  const t = msg.type;
+  const isAudio =
+    t === "response.audio.delta" || t === "response.output_audio.delta";
+
+  // ====== TRACK CURRENT RESPONSE FOR CANCELLATION ======
+  if (t === "response.created") {
+    currentResponseId = msg.response?.id || null;
+    allowAssistantAudio = true; // new assistant turn -> allow audio
+  }
+
+  // ====== INIT TRANSCRIPT BUFFERS ======
+  if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
+  if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
+
+  // ====== ASSISTANT TRANSCRIPT (buffered into sentences) ======
+  if (t === "response.audio_transcript.delta" && msg.delta) {
+    globalThis._assistantBuffer += msg.delta;
+
+    if (/[.!?"]$/.test(msg.delta.trim())) {
+      const sentence = globalThis._assistantBuffer.trim();
+
+      transcriptEntries.push({
+        speaker: "Assistant",
+        text: sentence,
+        time: Date.now(),
+        seq: sequenceCounter++,
+      });
+
+      setTimeout(() => {
+        sendGroupMeBatched("Assistant", sentence);
+      }, 1000);
+
+      globalThis._assistantBuffer = "";
+    }
+  }
+
+  // ====== CALLER TRANSCRIPT + BARGE-IN (on COMPLETED utterance) ======
+  if (
+    t === "conversation.item.input_audio_transcription.completed" &&
+    msg.transcript
+  ) {
+    if (globalThis._callerLastItemId !== msg.item_id) {
+      globalThis._callerLastItemId = msg.item_id;
+
+      transcriptEntries.push({
+        speaker: "Caller",
+        text: msg.transcript.trim(),
+        time: Date.now(),
+        seq: sequenceCounter++,
+      });
+
+      sendGroupMeBatched("Caller", msg.transcript.trim());
+
+      // 🔥 BARGE-IN HERE: user actually said something complete
+      allowAssistantAudio = false;
+
+      if (ws.readyState === WebSocket.OPEN && streamSid) {
+        ws.send(
+          JSON.stringify({
+            event: "clear",
+            streamSid,
+          })
+        );
       }
 
-      const t = msg.type;
-      const isAudio =
-        t === "response.audio.delta" || t === "response.output_audio.delta";
-
-      // ========== BARGE-IN LOGIC ==========
-
-      // 1) New assistant response created -> store response_id and allow audio
-      if (t === "response.created") {
-        currentResponseId = msg.response?.id || null;
-        allowAssistantAudio = true;
+      if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
+        oai.send(
+          JSON.stringify({
+            type: "response.cancel",
+            response_id: currentResponseId,
+          })
+        );
       }
+    }
+  }
 
-      // 2) Caller starts talking -> cut assistant audio + flush Twilio buffer + cancel response
-      if (
-        t === "input_audio_buffer.speech_started" ||
-        (t === "conversation.item.input_audio_transcription.delta" && msg.delta)
-      ) {
-        // Stop forwarding further assistant audio
-        allowAssistantAudio = false;
+  // ====== FORWARD ASSISTANT AUDIO TO TWILIO (gated) ======
+  if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: msg.delta },
+        })
+      );
+    }
+  }
+});
 
-        // Ask Twilio to drop any queued media it hasn't played yet
-        if (ws.readyState === WebSocket.OPEN && streamSid) {
-          ws.send(
-            JSON.stringify({
-              event: "clear",
-              streamSid,
-            })
-          );
-        }
-
-        // Cancel the current in-progress assistant response on OpenAI
-        if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
-          oai.send(
-            JSON.stringify({
-              type: "response.cancel",
-              response_id: currentResponseId,
-            })
-          );
-        }
-      }
-
-      // ========== CAPTIONS / TRANSCRIPT ==========
-
-      if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
-      if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
-
-      // --- Assistant transcript, buffered into sentences ---
-      if (t === "response.audio_transcript.delta" && msg.delta) {
-        globalThis._assistantBuffer += msg.delta;
-
-        if (/[.!?"]$/.test(msg.delta.trim())) {
-          const sentence = globalThis._assistantBuffer.trim();
-
-          transcriptEntries.push({
-            speaker: "Assistant",
-            text: sentence,
-            time: Date.now(),
-            seq: sequenceCounter++,
-          });
-
-          // Delay a bit so caller captions can arrive first
-          setTimeout(() => {
-            sendGroupMeBatched("Assistant", sentence);
-          }, 1000);
-
-          globalThis._assistantBuffer = "";
-        }
-      }
-
-      // --- Caller transcript (completed turns, deduped) ---
-      if (
-        t === "conversation.item.input_audio_transcription.completed" &&
-        msg.transcript
-      ) {
-        if (globalThis._callerLastItemId !== msg.item_id) {
-          globalThis._callerLastItemId = msg.item_id;
-
-          transcriptEntries.push({
-            speaker: "Caller",
-            text: msg.transcript.trim(),
-            time: Date.now(),
-            seq: sequenceCounter++,
-          });
-
-          sendGroupMeBatched("Caller", msg.transcript.trim());
-        }
-      }
-
-      // ========== FORWARD ASSISTANT AUDIO TO TWILIO (with barge-in gating) ==========
-      if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(
-            JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: msg.delta },
-            })
-          );
-        }
-      }
-    });
 
 
 
