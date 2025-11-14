@@ -81,14 +81,15 @@ app.get("/twiml", (req, res) => {
     .replace(/"/g, "&quot;");
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}">
-      <Parameter name="prompt" value="${promptAttr}"/>
-      <Parameter name="loop" value="${loopFlag ? "1" : "0"}"/>
-    </Stream>
-  </Connect>
-</Response>`;
+  <Response>
+    <Connect>
+      <Stream url="${wsUrl}" track="inbound">
+        <Parameter name="prompt" value="${promptAttr}"/>
+        <Parameter name="loop" value="${loopFlag ? "1" : "0"}"/>
+      </Stream>
+    </Connect>
+  </Response>`;
+
 
   res.set("Content-Type", "text/xml").send(xml);
 });
@@ -238,6 +239,7 @@ if (
     globalThis._callerLastItemId = msg.item_id;
 
     const callerText = msg.transcript.trim();
+    console.log("WHISPER COMPLETED:", callerText);
 
     // Optional: log what Whisper thinks it heard
     // console.log("WHISPER COMPLETED:", callerText);
@@ -580,11 +582,12 @@ async function makeTwilioCallWithTwiml(to, promptText) {
   const twiml =
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
-    `<Connect><Stream url="${streamUrl}">` +
+    `<Connect><Stream url="${streamUrl}" track="inbound">` +
     `<Parameter name="prompt" value="${safePrompt}"/>` +
     `<Parameter name="loop" value="0"/>` +
     `</Stream></Connect>` +
     `</Response>`;
+
 
   const body = new URLSearchParams({
     To: to,
