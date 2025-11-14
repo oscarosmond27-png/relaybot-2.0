@@ -229,45 +229,54 @@ oai.on("message", (data) => {
     }
   }
 
-  // ====== CALLER TRANSCRIPT + BARGE-IN (on COMPLETED utterance) ======
-  if (
-    t === "conversation.item.input_audio_transcription.completed" &&
-    msg.transcript
-  ) {
-    if (globalThis._callerLastItemId !== msg.item_id) {
-      globalThis._callerLastItemId = msg.item_id;
+// ====== CALLER TRANSCRIPT + BARGE-IN (on REAL utterance) ======
+if (
+  t === "conversation.item.input_audio_transcription.completed" &&
+  msg.transcript
+) {
+  if (globalThis._callerLastItemId !== msg.item_id) {
+    globalThis._callerLastItemId = msg.item_id;
 
-      transcriptEntries.push({
-        speaker: "Caller",
-        text: msg.transcript.trim(),
-        time: Date.now(),
-        seq: sequenceCounter++,
-      });
+    const callerText = msg.transcript.trim();
 
-      sendGroupMeBatched("Caller", msg.transcript.trim());
+    // 🔍 Ignore tiny/noisy "utterances" so we don't false-barge
+    if (callerText.length < 5) {
+      // e.g. "uh", "ok", noise, etc. -> don't cancel the bot for this
+      return;
+    }
 
-      // 🔥 BARGE-IN HERE: user actually said something complete
-      allowAssistantAudio = false;
+    transcriptEntries.push({
+      speaker: "Caller",
+      text: callerText,
+      time: Date.now(),
+      seq: sequenceCounter++,
+    });
 
-      if (ws.readyState === WebSocket.OPEN && streamSid) {
-        ws.send(
-          JSON.stringify({
-            event: "clear",
-            streamSid,
-          })
-        );
-      }
+    sendGroupMeBatched("Caller", callerText);
 
-      if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
-        oai.send(
-          JSON.stringify({
-            type: "response.cancel",
-            response_id: currentResponseId,
-          })
-        );
-      }
+    // 🔥 REAL BARGE-IN: user actually said a short sentence
+    allowAssistantAudio = false;
+
+    if (ws.readyState === WebSocket.OPEN && streamSid) {
+      ws.send(
+        JSON.stringify({
+          event: "clear",
+          streamSid,
+        })
+      );
+    }
+
+    if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
+      oai.send(
+        JSON.stringify({
+          type: "response.cancel",
+          response_id: currentResponseId,
+        })
+      );
     }
   }
+}
+
 
   // ====== FORWARD ASSISTANT AUDIO TO TWILIO (gated) ======
   if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
