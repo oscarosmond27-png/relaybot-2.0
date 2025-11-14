@@ -130,6 +130,8 @@ async function handleTwilio(ws, req) {
   let started = false;
 
   let transcriptText = ""; // collect everything said
+  let transcriptEntries = []; // structured events
+  let sequenceCounter = 0;     // guarantees ordering even with identical timestamps
   let hasBufferedAudio = false;
   let oai = null;
   let oaiReady = false;
@@ -206,26 +208,29 @@ async function handleTwilio(ws, req) {
         t === "response.audio.delta" || t === "response.output_audio.delta";
 
 
-      // --- transcript buffers (must persist inside handler) ---
+      // --- transcript buffers ---
       if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
       if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
       
-      // === ASSISTANT AUDIO TRANSCRIPT (sentence buffering) ===
+      // === ASSISTANT TRANSCRIPT (buffered into sentences) ===
       if (t === "response.audio_transcript.delta" && msg.delta) {
         globalThis._assistantBuffer += msg.delta;
       
-        // If delta ends with punctuation, treat as sentence end
         if (/[.!?"]$/.test(msg.delta.trim())) {
-          const fullSentence = globalThis._assistantBuffer.trim();
-          const line = `Assistant: ${fullSentence}`;
-          transcriptText += `\n${line}`;
-          console.log("CAPTION:", line);
+          const sentence = globalThis._assistantBuffer.trim();
       
-          globalThis._assistantBuffer = ""; // reset
+          transcriptEntries.push({
+            speaker: "Assistant",
+            text: sentence,
+            time: Date.now(),
+            seq: sequenceCounter++,
+          });
+      
+          globalThis._assistantBuffer = "";
         }
       }
       
-      // === CALLER TRANSCRIPT (only completed events, deduped) ===
+      // === CALLER TRANSCRIPT (completed only, deduped) ===
       if (
         t === "conversation.item.input_audio_transcription.completed" &&
         msg.transcript
@@ -233,11 +238,15 @@ async function handleTwilio(ws, req) {
         if (globalThis._callerLastItemId !== msg.item_id) {
           globalThis._callerLastItemId = msg.item_id;
       
-          const line = `Caller: ${msg.transcript.trim()}`;
-          transcriptText += `\n${line}`;
-          console.log("CAPTION:", line);
+          transcriptEntries.push({
+            speaker: "Caller",
+            text: msg.transcript.trim(),
+            time: Date.now(),
+            seq: sequenceCounter++,
+          });
         }
       }
+
 
       
 
@@ -345,7 +354,16 @@ async function handleTwilio(ws, req) {
       }
 
       try {
-        const transcript = transcriptText.trim();
+        // Sort events by time, fallback to seq for same-ms cases
+        transcriptEntries.sort((a, b) =>
+          a.time === b.time ? a.seq - b.seq : a.time - b.time
+        );
+        
+        // Build final transcript
+        const transcript = transcriptEntries
+          .map((e) => `${e.speaker}: ${e.text}`)
+          .join("\n");
+
 
         if (transcript.length < 30) {
           await sendGroupMe("📝 Call summary: No usable transcript captured.");
