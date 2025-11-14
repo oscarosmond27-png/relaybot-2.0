@@ -227,7 +227,10 @@ async function handleTwilio(ws, req) {
             seq: sequenceCounter++,
           });
     
-          console.log("CAPTION (Assistant):", sentence);
+          setTimeout(() => {
+            console.log("CAPTION (Assistant):", sentence);
+          }, 150);   // delay ~150ms to let caller transcript catch up
+
           globalThis._assistantBuffer = "";
         }
       }
