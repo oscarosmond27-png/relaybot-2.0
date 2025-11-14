@@ -183,17 +183,7 @@ async function handleTwilio(ws, req) {
         })
       );
   
-      // Initial response: say the prompt
-      oai.send(
-        JSON.stringify({
-          type: "response.create",
-          response: {
-            modalities: ["audio", "text"],
-            output_audio_transcription: { enable: true },   // << REQUIRED
-            instructions: `Start the call by saying exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: " Then clearly deliver this message: "${prompt}". After finishing, pause to allow the person to respond.`,
-          },
-        })
-      );
+
 
     });
   
@@ -290,18 +280,42 @@ async function handleTwilio(ws, req) {
     if (msg.event === "start" && !started) {
       started = true;
       streamSid = msg.start?.streamSid || null;
-
+    
       const cp = msg.start?.customParameters || {};
       if (typeof cp.prompt === "string" && cp.prompt.trim()) {
         prompt = cp.prompt.trim();
       }
-      echoMode = cp.loop === "1"; // currently unused
-
+    
+      echoMode = cp.loop === "1";
       console.log("Start received. prompt:", prompt);
-
+    
       ensureOpenAI();
+    
+      // 🔥 Wait until OpenAI socket is fully ready
+      const startIntro = setInterval(() => {
+        if (oaiReady && oai && oai.readyState === WebSocket.OPEN) {
+          clearInterval(startIntro);
+    
+          // 🔥 SEND THE INTRO HERE (NOT BEFORE!)
+          oai.send(
+            JSON.stringify({
+              type: "response.create",
+              response: {
+                modalities: ["audio", "text"],
+                output_audio_transcription: { enable: true },
+                instructions: `Start the call by saying exactly: 
+                  "Hello! I am Oscar's personal call assistant.
+                  Oscar has a message for you. He says: ${prompt}"
+                  Then pause and wait for the caller to respond.`,
+              },
+            })
+          );
+        }
+      }, 50);
+    
       return;
     }
+
 
     if (msg.event === "media" && streamSid) {
       if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
