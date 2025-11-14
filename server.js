@@ -228,8 +228,10 @@ async function handleTwilio(ws, req) {
           });
     
           setTimeout(() => {
-            sendCaptionToGPT("Assistant", sentence);
+            sendGroupMeBatched("Assistant", sentence);
           }, 350);
+
+
 
           globalThis._assistantBuffer = "";
         }
@@ -250,7 +252,8 @@ async function handleTwilio(ws, req) {
             seq: sequenceCounter++,
           });
     
-          sendCaptionToGPT("Caller", msg.transcript.trim());
+          sendGroupMeBatched("Caller", msg.transcript.trim());
+
         }
       }
     
@@ -469,6 +472,29 @@ async function sendCaptionToGPT(role, text) {
     console.error("GPT caption forward error:", err);
   }
 }
+
+// === GroupMe Caption Batcher ===
+let gmBatch = [];
+let gmBatchTimer = null;
+
+async function sendGroupMeBatched(role, text) {
+  gmBatch.push(`${role}: ${text}`);
+
+  if (gmBatchTimer) clearTimeout(gmBatchTimer);
+
+  // Send in a single combined message after 400ms of silence
+  gmBatchTimer = setTimeout(async () => {
+    const combined = gmBatch.join("\n");
+    gmBatch = [];
+
+    try {
+      await sendGroupMe(combined);
+    } catch (err) {
+      console.error("GroupMe batch send error:", err);
+    }
+  }, 400);
+}
+
 
 
 
