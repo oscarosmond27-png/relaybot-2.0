@@ -321,23 +321,17 @@ async function handleTwilio(ws, req) {
         commitTimer = setTimeout(() => {
           try {
             if (hasBufferedAudio) {
-              oai.send(
-                JSON.stringify({
-                  type: "input_audio_buffer.commit",
-                })
-              );
+              oai.send({
+                type: "input_audio_buffer.commit",
+              });
               hasBufferedAudio = false;
             }
-            oai.send(
-              JSON.stringify({
-                type: "response.create",
-                response: { modalities: ["audio", "text"] },
-              })
-            );
+            // ❗ NO response.create HERE — let turn_detection trigger replies
           } catch (err) {
-            console.error("Commit/send error:", err);
+            console.error("Commit error:", err);
           }
         }, DEBOUNCE_MS);
+
       }
       return;
     }
