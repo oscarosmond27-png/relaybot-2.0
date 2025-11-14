@@ -158,7 +158,7 @@ async function handleTwilio(ws, req) {
 
     oai.on("open", () => {
       oaiReady = true;
-
+    
       // Configure session
       oai.send(
         JSON.stringify({
@@ -168,16 +168,20 @@ async function handleTwilio(ws, req) {
             modalities: ["audio", "text"],
             input_audio_format: "g711_ulaw",
             output_audio_format: "g711_ulaw",
-            turn_detection: {
-              type: "server_vad",
-            },
+            turn_detection: { type: "server_vad" },
             instructions:
               "You are a friendly but concise phone agent. Speak in clear American English. Keep calls under 2 minutes.",
+    
+            // 🔹 NEW: ask the session to transcribe incoming audio
+            input_audio_transcription: {
+              model: "gpt-4o-transcribe", // or "whisper-1" depending on what you prefer
+              language: "en",             // optional but recommended
+            },
           },
         })
       );
-
-      // Initial response: deliver the prompt
+    
+      // Initial response...
       oai.send(
         JSON.stringify({
           type: "response.create",
@@ -188,6 +192,7 @@ async function handleTwilio(ws, req) {
         })
       );
     });
+
 
     oai.on("message", (data) => {
       let msg;
@@ -216,9 +221,24 @@ async function handleTwilio(ws, req) {
 
       // Capture transcript deltas (spoken text)
       if (t === "response.audio_transcript.delta" && msg.delta) {
-        transcriptText += msg.delta;
+        transcriptText += `\nAssistant: ${msg.delta}`;
+        console.log("CAPTION:", `Assistant: ${msg.delta}`);
       }
     });
+
+    // 🔹 NEW: log any input audio transcription events (caller speech)
+    if (
+      t === "conversation.item.input_audio_transcription.delta" ||
+      t === "conversation.item.input_audio_transcription.completed"
+    ) {
+      console.log(
+        "USER TRANSCRIPTION EVENT:",
+        JSON.stringify(msg, null, 2)
+      );
+    }
+
+    
+    
 
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
     oai.on("close", () => console.log("OpenAI socket closed"));
