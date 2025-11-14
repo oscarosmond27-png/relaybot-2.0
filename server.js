@@ -158,34 +158,30 @@ async function handleTwilio(ws, req) {
       }
     );
   
-    oai.on("open", () => {
-      oaiReady = true;
-  
-      // Configure session (now with input transcription)
-      oai.send(
-        JSON.stringify({
-          type: "session.update",
-          session: {
-            voice: "ash",
-            modalities: ["audio", "text"],
-            input_audio_format: "g711_ulaw",
-            output_audio_format: "g711_ulaw",
-            turn_detection: { type: "server_vad" },
-            instructions:
-              "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Sound natural and conversational. If asked directly whether you are an AI, answer honestly but briefly and redirect back to helping.",
+oai.on("open", () => {
+  oaiReady = true;
 
-            // 🔹 Option A: transcribe incoming audio too
-            input_audio_transcription: {
-              model: "whisper-1", // or another transcription-capable model
-              language: "en",
-            },
-          },
-        })
-      );
-  
+  oai.send(
+    JSON.stringify({
+      type: "session.update",
+      session: {
+        voice: "ash",
+        modalities: ["audio", "text"],
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        turn_detection: { type: "server_vad" },
+        instructions:
+          "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Sound natural and conversational. If asked directly whether you are an AI, answer honestly but briefly and redirect back to helping.",
+        input_audio_transcription: {
+          model: "whisper-1",
+          language: "en",
+        },
+      },
+    })
+  );
+});
 
 
-    });
   
     oai.on("message", (data) => {
       let msg;
@@ -291,19 +287,18 @@ async function handleTwilio(ws, req) {
     
       ensureOpenAI();
     
-      // 🔥 Wait until OpenAI socket is fully ready
-      const startIntro = setInterval(() => {
+      // 🔥 Wait until the OpenAI WS is ready, THEN send the intro
+      const introTimer = setInterval(() => {
         if (oaiReady && oai && oai.readyState === WebSocket.OPEN) {
-          clearInterval(startIntro);
+          clearInterval(introTimer);
     
-          // 🔥 SEND THE INTRO HERE (NOT BEFORE!)
           oai.send(
             JSON.stringify({
               type: "response.create",
               response: {
                 modalities: ["audio", "text"],
                 output_audio_transcription: { enable: true },
-                instructions: `At the start of the call, say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: ${prompt}" Then stop talking and wait for the caller to respond.`,
+                instructions: `At the start of the call, say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: ${prompt}" Then pause and wait for the caller to respond.`,
               },
             })
           );
@@ -312,6 +307,7 @@ async function handleTwilio(ws, req) {
     
       return;
     }
+
 
 
     if (msg.event === "media" && streamSid) {
