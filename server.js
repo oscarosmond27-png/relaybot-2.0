@@ -186,7 +186,7 @@ oai.on("open", () => {
     JSON.stringify({
       type: "session.update",
       session: {
-        voice: "verse",
+        voice: "alloy",
         modalities: ["audio", "text"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
@@ -196,7 +196,12 @@ oai.on("open", () => {
           silence_duration_ms: 300 // how long silence = turn finished
         },
         instructions:
-          "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Try to keep replies as short as possible. Sound natural but don't waste time on the call.",
+          "You are Oscar's professional phone assistant. " +
+          "Speak in clear American English with a calm, neutral tone. " +
+          "Do not sound overly cheerful, excited, or emotional. " +
+          "Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. " +
+          "Be polite but efficient and get to the point quickly. " +
+          "If asked directly whether you are an AI, answer honestly but briefly and redirect back to helping.",
         input_audio_transcription: {
           model: "gpt-4o-mini-transcribe",
           language: "en",
@@ -392,23 +397,25 @@ if (t === "input_audio_buffer.speech_started") {
         if (oaiReady && oai && oai.readyState === WebSocket.OPEN) {
           clearInterval(introTimer);
 
-          const baseInstructions =
-            "You are a friendly but concise phone assistant. " +
-            "Speak in clear American English. Keep calls under 2 minutes, " +
-            "with replies no longer than 1–2 short sentences. " +
-            "Sound natural and conversational. If asked directly whether you are an AI, " +
-            "answer honestly but briefly and redirect back to helping. " +
-            "When it seems the conversation is finished, say a brief goodbye that includes one of the keywords: " +
-            "'goodbye', 'have a great day', or 'talk to you later'. Saying one of these three messages will trigger the call to end. " +
-            "After you use one of the keywords to end the call stop talking." ;
+        const baseInstructions =
+          "You are Oscar's professional phone assistant. " +
+          "Speak in clear American English with a calm, neutral tone. " +
+          "Do not sound overly cheerful, excited, or emotional. " +
+          "Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. " +
+          "Be polite but efficient and get to the point quickly. " +
+          "If asked directly whether you are an AI, answer honestly but briefly and redirect back to helping. " +
+          "When it seems the conversation is finished, say a brief goodbye that includes one of the keywords: " +
+          "'goodbye', 'have a great day', or 'talk to you later'. Saying one of these three messages will trigger the call to end. " +
+          "After you use one of the keywords to end the call, stop talking.";
 
-          const callGoal = `The purpose of this call is to relay the message: ${prompt} to the caller. ` +
-            "Make sure you clearly deliver this message, repeat or clarify it if needed, " +
-            "and always be sure to ask the caller if they have a response to give back to Oscar." +
-            " If the caller has a message to give back to Oscar and they tell it to you, be sure to read it back to them so they can make any changes if they would like." +
-            " In the opening line you will ask if the caller wants to hear a message from Oscar. " +
-            "If they reply that they would like to hear it, relay the message ${prompt}." +
-            " If the caller asks for the message again, restate Oscar's message: ${prompt}." ;
+        const callGoal =
+          `The purpose of this call is to relay this message from Oscar: "${prompt}". ` +
+          "At the beginning, ask the caller if they would like to hear the message. " +
+          "If they say yes, clearly say the message once. " +
+          "If they seem confused, you may briefly clarify the message in your own words. " +
+          "You may ask once if they have any questions. " +
+          "Do not ask the caller to repeat the message back to you. " +
+          "Do not ask the caller to dictate a message back to Oscar unless they explicitly say they want to.";
 
           const openingLine =
             `Hello! I am Oscar's personal call assistant. ` +
