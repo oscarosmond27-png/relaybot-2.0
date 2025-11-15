@@ -181,7 +181,7 @@ oai.on("open", () => {
           silence_duration_ms: 300 // how long silence = turn finished
         },
         instructions:
-          "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Sound natural and conversational. If asked directly whether you are an AI, answer honestly but briefly and redirect back to helping.",
+          "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Try to keep replies as short as possible. Sound natural but don't waste time on the call.",
         input_audio_transcription: {
           model: "whisper-1",
           language: "en",
@@ -367,13 +367,16 @@ if (t === "input_audio_buffer.speech_started") {
             "Sound natural and conversational. If asked directly whether you are an AI, " +
             "answer honestly but briefly and redirect back to helping.";
 
-          const callGoal = `The purpose of this call is: ${prompt}. ` +
+          const callGoal = `The purpose of this call is to relay the message: ${prompt} to the caller. ` +
             "Make sure you clearly deliver this message, repeat or clarify it if needed, " +
-            "and answer simple follow-up questions about it.";
+            "and be sure to ask the caller if they have a response to give back to Oscar." + 
+            " In the opening line you will ask if the caller wants to hear a message from Oscar. " +
+            "If they reply that they would like to hear it, relay the message ${prompt}." +
+            " If the caller asks for the message again, restate Oscar's message: ${prompt}.;
 
           const openingLine =
             `Hello! I am Oscar's personal call assistant. ` +
-            `Oscar has a message for you. He says: ${prompt}.`;
+            `Oscar has a message for you. Would you like to hear it?`;
 
           // 1️⃣ Update session so GPT knows what this call is about AND what to say first
           oai.send(
