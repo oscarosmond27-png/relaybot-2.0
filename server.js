@@ -356,28 +356,59 @@ if (t === "input_audio_buffer.speech_started") {
     
       ensureOpenAI();
     
-      // 🔥 Wait until the OpenAI WS is ready, THEN send the intro
       const introTimer = setInterval(() => {
         if (oaiReady && oai && oai.readyState === WebSocket.OPEN) {
           clearInterval(introTimer);
-    
+      
+          const baseInstructions =
+            "You are a friendly but concise phone assistant. " +
+            "Speak in clear American English. Keep calls under 2 minutes, " +
+            "with replies no longer than 1–2 short sentences. " +
+            "Sound natural and conversational. If asked directly whether you are an AI, " +
+            "answer honestly but briefly and redirect back to helping.";
+      
+          const callGoal = `The purpose of this call is: ${prompt}. ` +
+            "Make sure you clearly deliver this message, repeat or clarify it if needed, " +
+            "and answer simple follow-up questions about it.";
+      
+          // 1️⃣ Update session so GPT knows what this call is about
+          oai.send(
+            JSON.stringify({
+              type: "session.update",
+              session: {
+                instructions: `${baseInstructions}\n\n${callGoal}`,
+              },
+            })
+          );
+      
+          // 2️⃣ Now trigger the opening line as an actual response
+          const openingLine =
+            `Hello! I am Oscar's personal call assistant. ` +
+            `Oscar has a message for you. He says: ${prompt}.`;
+      
+          // Give the model a text input that says what we want it to say
+          oai.send(
+            JSON.stringify({
+              type: "input_text",
+              text: `Say **exactly** this sentence, word for word, as your first line, then stop and wait for the other person to speak: "${openingLine}"`,
+            })
+          );
+      
           oai.send(
             JSON.stringify({
               type: "response.create",
               response: {
                 modalities: ["audio", "text"],
                 output_audio_transcription: { enable: true },
-                instructions: `At the start of the call, say exactly: "Hello! I am Oscar's personal call assistant. Oscar has a message for you. He says: ${prompt}" Then pause and wait for the caller to respond.`,
               },
             })
           );
         }
       }, 50);
+
     
       return;
     }
-
-
 
     if (msg.event === "media" && streamSid) {
       if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
