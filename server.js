@@ -249,7 +249,7 @@ oai.on("message", (data) => {
             endTwilioCall(callSid).catch((err) =>
               console.error("Error ending Twilio call:", err)
             );
-          }, 1200);
+          }, 3000);
         }
       
 
@@ -384,8 +384,9 @@ if (t === "input_audio_buffer.speech_started") {
             "with replies no longer than 1–2 short sentences. " +
             "Sound natural and conversational. If asked directly whether you are an AI, " +
             "answer honestly but briefly and redirect back to helping. " +
-            "When it seems the conversation is finished, say a brief goodbye such as " +
-            "'Okay, have a great day, goodbye.' and then stop talking." ;
+            "When it seems the conversation is finished, say a brief goodbye that includes one of the keywords: " +
+            "'goodbye', 'have a great day', or 'talk to you later'. Saying one of these three messages will trigger the call to end. " +
+            "After you use one of the keywords to end the call stop talking." ;
 
           const callGoal = `The purpose of this call is to relay the message: ${prompt} to the caller. ` +
             "Make sure you clearly deliver this message, repeat or clarify it if needed, " +
