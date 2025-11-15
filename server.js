@@ -236,15 +236,22 @@ if (t === "conversation.item.input_audio_transcription.completed" && msg.transcr
   const callerText = msg.transcript.trim();
   const words = callerText.split(/\s+/).filter(Boolean);
 
-  // Must be real speech: at least 1 real word or 2 short words, adjust as needed
-  if (words.length < 1) return;
-  if (callerText.length < 3) return;
+  // Debug: see exactly what Whisper heard
+  console.log("WHISPER COMPLETED:", JSON.stringify(callerText));
+
+  // 🔒 STRONG FILTER:
+  // - at least 15 characters
+  // - at least 3 words
+  if (callerText.length < 15 || words.length < 3) {
+    // too short / not a real phrase -> do NOT barge in
+    return;
+  }
 
   // Don't double-process same utterance
   if (globalThis._callerLastItemId === msg.item_id) return;
   globalThis._callerLastItemId = msg.item_id;
 
-  // Log it
+  // Store transcript
   transcriptEntries.push({
     speaker: "Caller",
     text: callerText,
@@ -254,7 +261,7 @@ if (t === "conversation.item.input_audio_transcription.completed" && msg.transcr
 
   sendGroupMeBatched("Caller", callerText);
 
-  // 🔥 REAL BARGE-IN TRIGGER
+  // 🔥 REAL BARGE-IN TRIGGER (on actual sentence)
   allowAssistantAudio = false;
 
   // Stop Twilio playback
@@ -263,7 +270,7 @@ if (t === "conversation.item.input_audio_transcription.completed" && msg.transcr
   }
 
   // Stop OpenAI assistant speech
-  if (currentResponseId && oai.readyState === WebSocket.OPEN) {
+  if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
     oai.send(
       JSON.stringify({
         type: "response.cancel",
@@ -272,6 +279,7 @@ if (t === "conversation.item.input_audio_transcription.completed" && msg.transcr
     );
   }
 }
+
 
 
 
