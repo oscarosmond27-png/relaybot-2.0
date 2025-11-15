@@ -186,7 +186,7 @@ oai.on("open", () => {
     JSON.stringify({
       type: "session.update",
       session: {
-        voice: "ash",
+        voice: "verse",
         modalities: ["audio", "text"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
@@ -404,7 +404,8 @@ if (t === "input_audio_buffer.speech_started") {
 
           const callGoal = `The purpose of this call is to relay the message: ${prompt} to the caller. ` +
             "Make sure you clearly deliver this message, repeat or clarify it if needed, " +
-            "and be sure to ask the caller if they have a response to give back to Oscar." + 
+            "and always be sure to ask the caller if they have a response to give back to Oscar." +
+            " If the caller has a message to give back to Oscar and they tell it to you, be sure to read it back to them so they can make any changes if they would like." +
             " In the opening line you will ask if the caller wants to hear a message from Oscar. " +
             "If they reply that they would like to hear it, relay the message ${prompt}." +
             " If the caller asks for the message again, restate Oscar's message: ${prompt}." ;
