@@ -22,7 +22,6 @@ app.post("/groupme", async (req, res) => {
 
     const text = (req.body?.text || "").trim();
     const senderType = req.body?.sender_type || "";
-    
 
     // Ignore messages from the bot itself
     if (senderType === "bot") {
@@ -33,7 +32,9 @@ app.post("/groupme", async (req, res) => {
     if (/^(end|stop|hang ?up)\s+calls?$/i.test(text)) {
       try {
         const endedCount = await endAllInProgressCalls();
-        await sendGroupMe(`Requested Twilio to end ${endedCount} in-progress call(s).`);
+        await sendGroupMe(
+          `Requested Twilio to end ${endedCount} in-progress call(s).`
+        );
       } catch (err) {
         console.error("Error ending calls:", err);
         await sendGroupMe("Failed to end calls due to an error.");
@@ -93,7 +94,7 @@ app.get("/twiml", (req, res) => {
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;");
 
-const xml = `<?xml version="1.0" encoding="UTF-8"?>
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <Stream url="${wsUrl}">
@@ -102,8 +103,6 @@ const xml = `<?xml version="1.0" encoding="UTF-8"?>
     </Stream>
   </Connect>
 </Response>`;
-
-
 
   res.set("Content-Type", "text/xml").send(xml);
 });
@@ -147,7 +146,7 @@ async function handleTwilio(ws, req) {
 
   let transcriptText = ""; // collect everything said
   let transcriptEntries = []; // structured events
-  let sequenceCounter = 0;     // guarantees ordering even with identical timestamps
+  let sequenceCounter = 0; // guarantees ordering even with identical timestamps
   let hasBufferedAudio = false;
   let oai = null;
   let oaiReady = false;
@@ -161,13 +160,14 @@ async function handleTwilio(ws, req) {
 
   function ensureOpenAI() {
     if (oai) return;
-  
+
     if (!process.env.OPENAI_API_KEY) {
       console.error("Missing OPENAI_API_KEY env var");
       return;
     }
-  
+
     oai = new WebSocket(
+      // still using the mini realtime preview model (cheapest realtime tier)
       "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview",
       "realtime",
       {
@@ -177,190 +177,182 @@ async function handleTwilio(ws, req) {
         },
       }
     );
-  
-oai.on("open", () => {
-  oaiReady = true;
 
-  oai.send(
-    JSON.stringify({
-      type: "session.update",
-      session: {
-        voice: "ash",
-        modalities: ["audio", "text"],
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        turn_detection: {
-          type: "server_vad",
-          threshold: 0.6,          // you can tune this
-          silence_duration_ms: 300 // how long silence = turn finished
-        },
-        instructions:
-          "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Try to keep replies as short as possible. Sound natural but don't waste time on the call.",
-        input_audio_transcription: {
-          model: "whisper-1",
-          language: "en",
-        },
-      },
-    })
-  );
-});
+    oai.on("open", () => {
+      oaiReady = true;
 
-
-  
-oai.on("message", (data) => {
-  let msg;
-  try {
-    msg = JSON.parse(data.toString());
-  } catch {
-    return;
-  }
-
-  const t = msg.type;
-  const isAudio =
-    t === "response.audio.delta" || t === "response.output_audio.delta";
-
-  // ====== TRACK CURRENT RESPONSE FOR CANCELLATION ======
-  if (t === "response.created") {
-    currentResponseId = msg.response?.id || null;
-    allowAssistantAudio = true; // new assistant turn -> allow audio
-  }
-
-  if (t === "response.completed" || t === "response.stopped") {
-    assistantSpeaking = false;     // bot is no longer talking
-    currentResponseId = null;      // nothing to cancel anymore
-    // (leave allowAssistantAudio alone; next turn will re-use it)
-  }
-
-  // ====== INIT TRANSCRIPT BUFFERS ======
-  if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
-  if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
-
-  // ====== ASSISTANT TRANSCRIPT (buffered into sentences) ======
-  if (t === "response.audio_transcript.delta" && msg.delta) {
-    globalThis._assistantBuffer += msg.delta;
-
-    if (/[.!?"]$/.test(msg.delta.trim())) {
-      const sentence = globalThis._assistantBuffer.trim();
-
-      transcriptEntries.push({
-        speaker: "Assistant",
-        text: sentence,
-        time: Date.now(),
-        seq: sequenceCounter++,
-      });
-
-      setTimeout(() => {
-        sendGroupMeBatched("Assistant", sentence);
-      }, 1000);
-      // 🚪 If the assistant clearly ends the conversation, hang up the call
-      if (
-        callSid &&
-        /\b(goodbye|have a great day|i'll let you go|talk to you later)\b/i.test(sentence)
-      ) {
-          // Wait a moment so the goodbye audio finishes playing
-          setTimeout(() => {
-            endTwilioCall(callSid).catch((err) =>
-              console.error("Error ending Twilio call:", err)
-            );
-          }, 3000);
-        }
-      
-
-
-
-      
-      globalThis._assistantBuffer = "";
-    }
-  }
-
-// ====== CALLER TRANSCRIPT (for logging only) ======
-if (t === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
-  const callerText = msg.transcript.trim();
-  const words = callerText.split(/\s+/).filter(Boolean);
-
-  if (words.length < 1 || callerText.length < 3) return;
-
-  if (globalThis._callerLastItemId === msg.item_id) return;
-  globalThis._callerLastItemId = msg.item_id;
-
-  transcriptEntries.push({
-    speaker: "Caller",
-    text: callerText,
-    time: Date.now(),
-    seq: sequenceCounter++,
-  });
-
-  sendGroupMeBatched("Caller", callerText);
-
-  // ❌ no barge-in logic here anymore
-}
-
-// ====== BARGE-IN: user starts talking WHILE bot is speaking ======
-if (t === "input_audio_buffer.speech_started") {
-  console.log("speech_started; assistantSpeaking =", assistantSpeaking);
-
-  // Only barge in if the bot is talking
-  if (!assistantSpeaking) return;
-
-  // Clear any previous timer so we don't stack them
-  if (bargeInTimeout) {
-    clearTimeout(bargeInTimeout);
-    bargeInTimeout = null;
-  }
-
-  // Wait ~150ms to confirm it's *actual* speech, not a click/pop
-  bargeInTimeout = setTimeout(() => {
-    console.log("⏱ Debounced barge-in firing");
-
-    allowAssistantAudio = false;
-    assistantSpeaking = false;
-
-    // Stop Twilio playback
-    if (ws.readyState === WebSocket.OPEN && streamSid) {
-      ws.send(JSON.stringify({ event: "clear", streamSid }));
-    }
-
-    // Stop OpenAI assistant speech
-    if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
       oai.send(
         JSON.stringify({
-          type: "response.cancel",
-          response_id: currentResponseId,
+          type: "session.update",
+          session: {
+            voice: "ash",
+            modalities: ["audio", "text"],
+            input_audio_format: "g711_ulaw",
+            output_audio_format: "g711_ulaw",
+            turn_detection: {
+              type: "server_vad",
+              threshold: 0.6,
+              // less aggressive VAD => fewer turns => cheaper
+              silence_duration_ms: 900,
+            },
+            instructions:
+              "You are Oscar's phone assistant. Speak clear American English. Keep calls under 2 minutes. Use very short, direct sentences. Be friendly but efficient. When the conversation seems finished, say a brief goodbye including one of: 'goodbye', 'have a great day', or 'talk to you later', then stay silent.",
+            input_audio_transcription: {
+              // cheaper transcription model
+              model: "whisper-mini",
+              language: "en",
+            },
+          },
         })
       );
-    }
-  }, 150); // <<< tweak this: 100 = more sensitive, 200 = less
-}
+    });
 
+    oai.on("message", (data) => {
+      let msg;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return;
+      }
 
+      const t = msg.type;
+      const isAudio =
+        t === "response.audio.delta" || t === "response.output_audio.delta";
 
+      // ====== TRACK CURRENT RESPONSE FOR CANCELLATION ======
+      if (t === "response.created") {
+        currentResponseId = msg.response?.id || null;
+        allowAssistantAudio = true; // new assistant turn -> allow audio
+      }
 
+      if (t === "response.completed" || t === "response.stopped") {
+        assistantSpeaking = false; // bot is no longer talking
+        currentResponseId = null; // nothing to cancel anymore
+        // (leave allowAssistantAudio alone; next turn will re-use it)
+      }
 
+      // ====== INIT TRANSCRIPT BUFFERS ======
+      if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
+      if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
 
-  // ====== FORWARD ASSISTANT AUDIO TO TWILIO (gated) ======
-  if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
-    assistantSpeaking = true; // bot is actively talking
-  
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: msg.delta },
-        })
-      );
-    }
-  }
-});
+      // ====== ASSISTANT TRANSCRIPT (buffered into sentences) ======
+      if (t === "response.audio_transcript.delta" && msg.delta) {
+        globalThis._assistantBuffer += msg.delta;
 
+        if (/[.!?"]$/.test(msg.delta.trim())) {
+          const sentence = globalThis._assistantBuffer.trim();
 
+          transcriptEntries.push({
+            speaker: "Assistant",
+            text: sentence,
+            time: Date.now(),
+            seq: sequenceCounter++,
+          });
 
+          setTimeout(() => {
+            sendGroupMeBatched("Assistant", sentence);
+          }, 1000);
 
-  
+          // 🚪 If the assistant clearly ends the conversation, hang up the call
+          if (
+            callSid &&
+            /\b(goodbye|have a great day|i'll let you go|talk to you later)\b/i.test(
+              sentence
+            )
+          ) {
+            // Wait long enough so the goodbye audio fully finishes before hangup
+            setTimeout(() => {
+              endTwilioCall(callSid).catch((err) =>
+                console.error("Error ending Twilio call:", err)
+              );
+            }, 3000);
+          }
+
+          globalThis._assistantBuffer = "";
+        }
+      }
+
+      // ====== CALLER TRANSCRIPT (for logging only) ======
+      if (
+        t === "conversation.item.input_audio_transcription.completed" &&
+        msg.transcript
+      ) {
+        const callerText = msg.transcript.trim();
+        const words = callerText.split(/\s+/).filter(Boolean);
+
+        if (words.length < 1 || callerText.length < 3) return;
+
+        if (globalThis._callerLastItemId === msg.item_id) return;
+        globalThis._callerLastItemId = msg.item_id;
+
+        transcriptEntries.push({
+          speaker: "Caller",
+          text: callerText,
+          time: Date.now(),
+          seq: sequenceCounter++,
+        });
+
+        sendGroupMeBatched("Caller", callerText);
+
+        // ❌ no barge-in logic here anymore
+      }
+
+      // ====== BARGE-IN: user starts talking WHILE bot is speaking ======
+      if (t === "input_audio_buffer.speech_started") {
+        console.log("speech_started; assistantSpeaking =", assistantSpeaking);
+
+        // Only barge in if the bot is talking
+        if (!assistantSpeaking) return;
+
+        // Clear any previous timer so we don't stack them
+        if (bargeInTimeout) {
+          clearTimeout(bargeInTimeout);
+          bargeInTimeout = null;
+        }
+
+        // Wait ~150ms to confirm it's *actual* speech, not a click/pop
+        bargeInTimeout = setTimeout(() => {
+          console.log("⏱ Debounced barge-in firing");
+
+          allowAssistantAudio = false;
+          assistantSpeaking = false;
+
+          // Stop Twilio playback
+          if (ws.readyState === WebSocket.OPEN && streamSid) {
+            ws.send(JSON.stringify({ event: "clear", streamSid }));
+          }
+
+          // Stop OpenAI assistant speech
+          if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
+            oai.send(
+              JSON.stringify({
+                type: "response.cancel",
+                response_id: currentResponseId,
+              })
+            );
+          }
+        }, 150); // <<< tweak this: 100 = more sensitive, 200 = less
+      }
+
+      // ====== FORWARD ASSISTANT AUDIO TO TWILIO (gated) ======
+      if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
+        assistantSpeaking = true; // bot is actively talking
+
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              event: "media",
+              streamSid,
+              media: { payload: msg.delta },
+            })
+          );
+        }
+      }
+    });
+
     oai.on("error", (err) => console.error("OpenAI WS error:", err));
     oai.on("close", () => console.log("OpenAI socket closed"));
   }
-
 
   ws.on("message", async (buf) => {
     let msg;
@@ -392,25 +384,17 @@ if (t === "input_audio_buffer.speech_started") {
           clearInterval(introTimer);
 
           const baseInstructions =
-            "You are a friendly but concise phone assistant. " +
-            "Speak in clear American English. Keep calls under 2 minutes, " +
-            "with replies no longer than 1–2 short sentences. " +
-            "Sound natural and conversational. If asked directly whether you are an AI, " +
-            "answer honestly but briefly and redirect back to helping. " +
-            "When it seems the conversation is finished, say a brief goodbye that includes one of the keywords: " +
-            "'goodbye', 'have a great day', or 'talk to you later'. Saying one of these three messages will trigger the call to end. " +
-            "After you use one of the keywords to end the call stop talking." ;
+            "You are Oscar's phone assistant. Speak clear American English. Keep calls under 2 minutes. Use very short, direct sentences. Be friendly but efficient. When the conversation seems finished, say a brief goodbye including one of: 'goodbye', 'have a great day', or 'talk to you later', then stay silent.";
 
-          const callGoal = `The purpose of this call is to relay the message: ${prompt} to the caller. ` +
-            "Make sure you clearly deliver this message, repeat or clarify it if needed, " +
-            "and be sure to ask the caller if they have a response to give back to Oscar." + 
-            " In the opening line you will ask if the caller wants to hear a message from Oscar. " +
-            "If they reply that they would like to hear it, relay the message ${prompt}." +
-            " If the caller asks for the message again, restate Oscar's message: ${prompt}." ;
+          const callGoal = `
+The purpose of this call is to relay this message from Oscar: "${prompt}".
+Ask if the caller wants to hear the message. If they say yes, state it clearly once.
+If they ask to hear it again, repeat it briefly.
+After giving the message, ask if they have a response for Oscar and capture it.
+`.trim();
 
           const openingLine =
-            `Hello! I am Oscar's personal call assistant. ` +
-            `Oscar has a message for you. Would you like to hear it?`;
+            "Hello! I am Oscar's personal call assistant. Oscar has a message for you. Would you like to hear it?";
 
           // 1️⃣ Update session so GPT knows what this call is about AND what to say first
           oai.send(
@@ -420,8 +404,7 @@ if (t === "input_audio_buffer.speech_started") {
                 instructions:
                   `${baseInstructions}\n\n` +
                   `${callGoal}\n\n` +
-                  `Your VERY FIRST utterance on this call must be exactly this sentence, word for word, and nothing else. After you say it, stop talking and wait for the other person to respond:\n` +
-                  `"${openingLine}"`,
+                  `Your VERY FIRST utterance on this call must be exactly this sentence, word for word, and nothing else. After you say it, stop talking and wait for the other person to respond:\n"${openingLine}"`,
               },
             })
           );
@@ -442,7 +425,6 @@ if (t === "input_audio_buffer.speech_started") {
       return;
     }
 
-
     if (msg.event === "media" && streamSid) {
       if (oai && oaiReady && oai.readyState === WebSocket.OPEN) {
         // Append audio to OpenAI input buffer
@@ -461,7 +443,7 @@ if (t === "input_audio_buffer.speech_started") {
             if (hasBufferedAudio) {
               oai.send(
                 JSON.stringify({
-                  type: "input_audio_buffer.commit"
+                  type: "input_audio_buffer.commit",
                 })
               );
               hasBufferedAudio = false;
@@ -472,8 +454,6 @@ if (t === "input_audio_buffer.speech_started") {
             console.error("Commit error:", err);
           }
         }, DEBOUNCE_MS);
-        
-
       }
       return;
     }
@@ -494,15 +474,15 @@ if (t === "input_audio_buffer.speech_started") {
         transcriptEntries.sort((a, b) =>
           a.time === b.time ? a.seq - b.seq : a.time - b.time
         );
-        
+
         // Build final transcript
         const transcript = transcriptEntries
           .map((e) => `${e.speaker}: ${e.text}`)
           .join("\n");
 
-          // 🔹 NEW: send full transcript to GroupMe
-          await sendGroupMe(`📄 Full transcript:\n${transcript}`);
-        
+        // 🔹 Send full transcript to GroupMe (no cost impact)
+        await sendGroupMe(`📄 Full transcript:\n${transcript}`);
+
         if (transcript.length < 30) {
           await sendGroupMe("📝 Call summary: No usable transcript captured.");
           try {
@@ -524,6 +504,13 @@ if (t === "input_audio_buffer.speech_started") {
           return;
         }
 
+        // 💸 Cap how much text we send into the summary call
+        let trimmedTranscript = transcript;
+        const MAX_CHARS = 2000; // ~ a couple of pages of text max
+        if (trimmedTranscript.length > MAX_CHARS) {
+          trimmedTranscript = trimmedTranscript.slice(-MAX_CHARS);
+        }
+
         const summaryResponse = await fetch(
           "https://api.openai.com/v1/chat/completions",
           {
@@ -542,7 +529,7 @@ if (t === "input_audio_buffer.speech_started") {
                 },
                 {
                   role: "user",
-                  content: `Here is the transcript of a phone call:\n\n${transcript}\n\nSummarize what was said in 2–3 sentences. Be factual and concise.`,
+                  content: `Here is the transcript of a phone call:\n\n${trimmedTranscript}\n\nSummarize what was said in 2–3 sentences. Be factual and concise.`,
                 },
               ],
             }),
@@ -602,14 +589,14 @@ async function sendCaptionToGPT(role, text) {
         messages: [
           {
             role: "system",
-            content: "You receive caller and assistant captions in real time."
+            content: "You receive caller and assistant captions in real time.",
           },
           {
             role: "user",
-            content: `${role}: ${text}`
-          }
-        ]
-      })
+            content: `${role}: ${text}`,
+          },
+        ],
+      }),
     });
   } catch (err) {
     console.error("GPT caption forward error:", err);
@@ -637,9 +624,6 @@ async function sendGroupMeBatched(role, text) {
     }
   }, 400);
 }
-
-
-
 
 function normalizePhone(s) {
   const digits = s.replace(/\D/g, "");
@@ -744,7 +728,6 @@ async function endAllInProgressCalls() {
   return calls.length;
 }
 
-
 async function makeTwilioCallWithTwiml(to, promptText) {
   const api = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls.json`;
 
@@ -758,15 +741,14 @@ async function makeTwilioCallWithTwiml(to, promptText) {
 
   const streamUrl = `wss://${process.env.BASE_HOST || "relaybot-2-0.onrender.com"}/twilio`;
 
-const twiml =
-  `<?xml version="1.0" encoding="UTF-8"?>` +
-  `<Response>` +
-  `<Connect><Stream url="${streamUrl}">` +
-  `<Parameter name="prompt" value="${safePrompt}"/>` +
-  `<Parameter name="loop" value="0"/>` +
-  `</Stream></Connect>` +
-  `</Response>`;
-
+  const twiml =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Response>` +
+    `<Connect><Stream url="${streamUrl}">` +
+    `<Parameter name="prompt" value="${safePrompt}"/>` +
+    `<Parameter name="loop" value="0"/>` +
+    `</Stream></Connect>` +
+    `</Response>`;
 
   const body = new URLSearchParams({
     To: to,
