@@ -141,6 +141,7 @@ async function handleTwilio(ws, req) {
   let allowAssistantAudio = true; // <- controls barge-in: whether Twilio is allowed to play assistant audio
   let currentResponseId = null; // NEW
   let assistantSpeaking = false; // is the bot currently speaking?
+  let bargeInTimeout = null;
 
   const DEBOUNCE_MS = 700;
 
@@ -174,7 +175,12 @@ oai.on("open", () => {
         modalities: ["audio", "text"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad" },
+        turn_detection: {
+          type: "server_vad",
+          threshold: 0.65,      // higher = needs clearer speech to trigger
+          min_silence_ms: 250,  // how long silence must last before it thinks you're done
+          spoke_ms: 200         // how long you must be talking before it's "real" speech
+        },
         instructions:
           "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Sound natural and conversational. If asked directly whether you are an AI, answer honestly but briefly and redirect back to helping.",
         input_audio_transcription: {
@@ -265,26 +271,38 @@ if (t === "input_audio_buffer.speech_started") {
   console.log("speech_started; assistantSpeaking =", assistantSpeaking);
 
   // Only barge in if the bot is talking
-  if (!assistantSpeaking) {
-    return;
+  if (!assistantSpeaking) return;
+
+  // Clear any previous timer so we don't stack them
+  if (bargeInTimeout) {
+    clearTimeout(bargeInTimeout);
+    bargeInTimeout = null;
   }
 
-  allowAssistantAudio = false;
-  assistantSpeaking = false;
+  // Wait ~150ms to confirm it's *actual* speech, not a click/pop
+  bargeInTimeout = setTimeout(() => {
+    console.log("⏱ Debounced barge-in firing");
 
-  if (ws.readyState === WebSocket.OPEN && streamSid) {
-    ws.send(JSON.stringify({ event: "clear", streamSid }));
-  }
+    allowAssistantAudio = false;
+    assistantSpeaking = false;
 
-  if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
-    oai.send(
-      JSON.stringify({
-        type: "response.cancel",
-        response_id: currentResponseId,
-      })
-    );
-  }
+    // Stop Twilio playback
+    if (ws.readyState === WebSocket.OPEN && streamSid) {
+      ws.send(JSON.stringify({ event: "clear", streamSid }));
+    }
+
+    // Stop OpenAI assistant speech
+    if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
+      oai.send(
+        JSON.stringify({
+          type: "response.cancel",
+          response_id: currentResponseId,
+        })
+      );
+    }
+  }, 150); // <<< tweak this: 100 = more sensitive, 200 = less
 }
+
 
 
 
@@ -495,6 +513,7 @@ if (t === "input_audio_buffer.speech_started") {
 
   ws.on("close", () => {
     if (commitTimer) clearTimeout(commitTimer);
+    if (bargeInTimeout) clearTimeout(bargeInTimeout);
     if (oai && oai.readyState === WebSocket.OPEN) {
       try {
         oai.close();
