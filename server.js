@@ -140,6 +140,7 @@ async function handleTwilio(ws, req) {
   let commitTimer = null;
   let allowAssistantAudio = true; // <- controls barge-in: whether Twilio is allowed to play assistant audio
   let currentResponseId = null; // NEW
+  let assistantSpeaking = false; // is the bot currently speaking?
 
   const DEBOUNCE_MS = 700;
 
@@ -205,6 +206,12 @@ oai.on("message", (data) => {
     allowAssistantAudio = true; // new assistant turn -> allow audio
   }
 
+  if (t === "response.completed" || t === "response.stopped") {
+    assistantSpeaking = false;     // bot is no longer talking
+    currentResponseId = null;      // nothing to cancel anymore
+    // (leave allowAssistantAudio alone; next turn will re-use it)
+  }
+
   // ====== INIT TRANSCRIPT BUFFERS ======
   if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
   if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
@@ -231,27 +238,16 @@ oai.on("message", (data) => {
     }
   }
 
-// ====== CALLER TRANSCRIPT + SAFE BARGE-IN ======
+// ====== CALLER TRANSCRIPT (for logging only) ======
 if (t === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
   const callerText = msg.transcript.trim();
   const words = callerText.split(/\s+/).filter(Boolean);
 
-  // Debug: see exactly what Whisper heard
-  console.log("WHISPER COMPLETED:", JSON.stringify(callerText));
+  if (words.length < 1 || callerText.length < 3) return;
 
-  // 🔒 STRONG FILTER:
-  // - at least 15 characters
-  // - at least 3 words
-  if (callerText.length < 15 || words.length < 3) {
-    // too short / not a real phrase -> do NOT barge in
-    return;
-  }
-
-  // Don't double-process same utterance
   if (globalThis._callerLastItemId === msg.item_id) return;
   globalThis._callerLastItemId = msg.item_id;
 
-  // Store transcript
   transcriptEntries.push({
     speaker: "Caller",
     text: callerText,
@@ -261,23 +257,33 @@ if (t === "conversation.item.input_audio_transcription.completed" && msg.transcr
 
   sendGroupMeBatched("Caller", callerText);
 
-  // 🔥 REAL BARGE-IN TRIGGER (on actual sentence)
-//  allowAssistantAudio = false;
+  // ❌ no barge-in logic here anymore
+}
 
-  // Stop Twilio playback
-  //if (ws.readyState === WebSocket.OPEN && streamSid) {
-    //ws.send(JSON.stringify({ event: "clear", streamSid }));
-  //}
+// ====== BARGE-IN: user starts talking WHILE bot is speaking ======
+if (t === "input_audio_buffer.speech_started") {
+  console.log("speech_started; assistantSpeaking =", assistantSpeaking);
 
-  // Stop OpenAI assistant speech
-//  if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
-  //  oai.send(
-     // JSON.stringify({
-       // type: "response.cancel",
-        //response_id: currentResponseId,
-      //})
-    //);
-  //}
+  // Only barge in if the bot is talking
+  if (!assistantSpeaking) {
+    return;
+  }
+
+  allowAssistantAudio = false;
+  assistantSpeaking = false;
+
+  if (ws.readyState === WebSocket.OPEN && streamSid) {
+    ws.send(JSON.stringify({ event: "clear", streamSid }));
+  }
+
+  if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
+    oai.send(
+      JSON.stringify({
+        type: "response.cancel",
+        response_id: currentResponseId,
+      })
+    );
+  }
 }
 
 
@@ -286,6 +292,8 @@ if (t === "conversation.item.input_audio_transcription.completed" && msg.transcr
 
   // ====== FORWARD ASSISTANT AUDIO TO TWILIO (gated) ======
   if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
+    assistantSpeaking = true; // bot is actively talking
+  
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(
         JSON.stringify({
