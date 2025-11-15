@@ -130,6 +130,7 @@ async function handleTwilio(ws, req) {
   let echoMode = false; // currently unused, but kept for future behavior
   let streamSid = null;
   let started = false;
+  let callSid = null;
 
   let transcriptText = ""; // collect everything said
   let transcriptEntries = []; // structured events
@@ -238,7 +239,23 @@ oai.on("message", (data) => {
       setTimeout(() => {
         sendGroupMeBatched("Assistant", sentence);
       }, 1000);
+      // 🚪 If the assistant clearly ends the conversation, hang up the call
+      if (
+        callSid &&
+        /\b(goodbye|have a great day|i'll let you go|talk to you later)\b/i.test(sentence)
+      ) {
+          // Wait a moment so the goodbye audio finishes playing
+          setTimeout(() => {
+            endTwilioCall(callSid).catch((err) =>
+              console.error("Error ending Twilio call:", err)
+            );
+          }, 1200);
+        }
+      
 
+
+
+      
       globalThis._assistantBuffer = "";
     }
   }
@@ -345,6 +362,7 @@ if (t === "input_audio_buffer.speech_started") {
     if (msg.event === "start" && !started) {
       started = true;
       streamSid = msg.start?.streamSid || null;
+      callSid = msg.start?.callSid || null;
 
       const cp = msg.start?.customParameters || {};
       if (typeof cp.prompt === "string" && cp.prompt.trim()) {
@@ -365,7 +383,9 @@ if (t === "input_audio_buffer.speech_started") {
             "Speak in clear American English. Keep calls under 2 minutes, " +
             "with replies no longer than 1–2 short sentences. " +
             "Sound natural and conversational. If asked directly whether you are an AI, " +
-            "answer honestly but briefly and redirect back to helping.";
+            "answer honestly but briefly and redirect back to helping. " +
+            "When it seems the conversation is finished, say a brief goodbye such as " +
+            "'Okay, have a great day, goodbye.' and then stop talking." ;
 
           const callGoal = `The purpose of this call is to relay the message: ${prompt} to the caller. ` +
             "Make sure you clearly deliver this message, repeat or clarify it if needed, " +
@@ -616,6 +636,37 @@ function normalizePhone(s) {
 
   return null;
 }
+
+async function endTwilioCall(callSid) {
+  if (!callSid) return;
+
+  const api = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls/${callSid}.json`;
+
+  const auth = Buffer.from(
+    `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`
+  ).toString("base64");
+
+  const body = new URLSearchParams({
+    Status: "completed",
+  });
+
+  const res = await fetch(api, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    console.error("Twilio end call failed:", await res.text());
+  } else {
+    console.log("Twilio call ended by assistant decision.");
+  }
+}
+
+
 
 async function makeTwilioCallWithTwiml(to, promptText) {
   const api = `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Calls.json`;
