@@ -198,7 +198,7 @@ oai.on("open", () => {
         instructions:
           "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Try to keep replies as short as possible. Sound natural but don't waste time on the call.",
         input_audio_transcription: {
-          model: "whisper-mini",
+          model: "gpt-4o-mini-transcribe",
           language: "en",
         },
       },
