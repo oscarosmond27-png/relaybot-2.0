@@ -168,7 +168,7 @@ async function handleTwilio(ws, req) {
     }
   
     oai = new WebSocket(
-      "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview",
+      "wss://api.openai.com/v1/realtime?model=gpt-realtime-mini-2025-10-06",
       "realtime",
       {
         headers: {
@@ -177,6 +177,7 @@ async function handleTwilio(ws, req) {
         },
       }
     );
+
   
 oai.on("open", () => {
   oaiReady = true;
@@ -197,7 +198,7 @@ oai.on("open", () => {
         instructions:
           "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Try to keep replies as short as possible. Sound natural but don't waste time on the call.",
         input_audio_transcription: {
-          model: "whisper-1",
+          model: "whisper-mini",
           language: "en",
         },
       },
