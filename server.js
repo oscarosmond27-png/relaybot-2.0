@@ -186,7 +186,7 @@ oai.on("open", () => {
     JSON.stringify({
       type: "session.update",
       session: {
-        voice: "alloy",
+        voice: "ash",
         modalities: ["audio", "text"],
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
