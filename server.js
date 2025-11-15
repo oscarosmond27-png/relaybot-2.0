@@ -168,7 +168,7 @@ async function handleTwilio(ws, req) {
     }
   
     oai = new WebSocket(
-      "wss://api.openai.com/v1/realtime?model=gpt-realtime-mini-2025-10-06",
+      "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview",
       "realtime",
       {
         headers: {
