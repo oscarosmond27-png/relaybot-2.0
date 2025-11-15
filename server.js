@@ -372,7 +372,7 @@ if (t === "input_audio_buffer.speech_started") {
             "and be sure to ask the caller if they have a response to give back to Oscar." + 
             " In the opening line you will ask if the caller wants to hear a message from Oscar. " +
             "If they reply that they would like to hear it, relay the message ${prompt}." +
-            " If the caller asks for the message again, restate Oscar's message: ${prompt}.;
+            " If the caller asks for the message again, restate Oscar's message: ${prompt}." ;
 
           const openingLine =
             `Hello! I am Oscar's personal call assistant. ` +
