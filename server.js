@@ -177,9 +177,8 @@ oai.on("open", () => {
         output_audio_format: "g711_ulaw",
         turn_detection: {
           type: "server_vad",
-          threshold: 0.65,      // higher = needs clearer speech to trigger
-          min_silence_ms: 250,  // how long silence must last before it thinks you're done
-          spoke_ms: 200         // how long you must be talking before it's "real" speech
+          threshold: 0.6,          // you can tune this
+          silence_duration_ms: 300 // how long silence = turn finished
         },
         instructions:
           "You are a friendly but concise phone assistant. Speak in clear American English. Keep calls under 2 minutes, with replies no longer than 1–2 short sentences. Sound natural and conversational. If asked directly whether you are an AI, answer honestly but briefly and redirect back to helping.",
