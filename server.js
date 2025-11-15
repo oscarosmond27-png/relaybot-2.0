@@ -262,22 +262,22 @@ if (t === "conversation.item.input_audio_transcription.completed" && msg.transcr
   sendGroupMeBatched("Caller", callerText);
 
   // 🔥 REAL BARGE-IN TRIGGER (on actual sentence)
-  allowAssistantAudio = false;
+//  allowAssistantAudio = false;
 
   // Stop Twilio playback
-  if (ws.readyState === WebSocket.OPEN && streamSid) {
-    ws.send(JSON.stringify({ event: "clear", streamSid }));
-  }
+  //if (ws.readyState === WebSocket.OPEN && streamSid) {
+    //ws.send(JSON.stringify({ event: "clear", streamSid }));
+  //}
 
   // Stop OpenAI assistant speech
-  if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
-    oai.send(
-      JSON.stringify({
-        type: "response.cancel",
-        response_id: currentResponseId,
-      })
-    );
-  }
+//  if (currentResponseId && oai && oai.readyState === WebSocket.OPEN) {
+  //  oai.send(
+     // JSON.stringify({
+       // type: "response.cancel",
+        //response_id: currentResponseId,
+      //})
+    //);
+  //}
 }
 
 
