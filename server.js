@@ -157,6 +157,12 @@ async function handleTwilio(ws, req) {
   let assistantSpeaking = false; // is the bot currently speaking?
   let bargeInTimeout = null;
 
+  // For graceful hangup after goodbye
+  let goodbyeDetected = false;       // did the assistant say goodbye?
+  let lastAudioOutTime = null;       // last time we sent audio to Twilio
+  let goodbyeCheckTimer = null;      // interval that watches for audio to finish
+
+
   const DEBOUNCE_MS = 700;
 
   function ensureOpenAI() {
@@ -224,6 +230,14 @@ oai.on("message", (data) => {
   const isAudio =
     t === "response.audio.delta" || t === "response.output_audio.delta";
 
+  // ✅ Make sure buffers exist before we append
+  if (globalThis._assistantBuffer === undefined) {
+    globalThis._assistantBuffer = "";
+  }
+  if (globalThis._callerLastItemId === undefined) {
+    globalThis._callerLastItemId = null;
+  }
+
   // ====== TRACK CURRENT RESPONSE FOR CANCELLATION ======
   if (t === "response.created") {
     currentResponseId = msg.response?.id || null;
@@ -237,10 +251,6 @@ oai.on("message", (data) => {
   }
 
   // ====== INIT TRANSCRIPT BUFFERS ======
-  if (!globalThis._assistantBuffer) globalThis._assistantBuffer = "";
-  if (!globalThis._callerLastItemId) globalThis._callerLastItemId = null;
-
-  // ====== ASSISTANT TRANSCRIPT (buffered into sentences) ======
   if (t === "response.audio_transcript.delta" && msg.delta) {
     globalThis._assistantBuffer += msg.delta;
 
@@ -256,27 +266,21 @@ oai.on("message", (data) => {
 
       setTimeout(() => {
         sendGroupMeBatched("Assistant", sentence);
-      }, 1000);
-      // 🚪 If the assistant clearly ends the conversation, hang up the call
+      }, 1500);
+
+      // 🚪 If the assistant clearly ends the conversation, mark goodbye
       if (
         callSid &&
         /\b(goodbye|have a great day|i'll let you go|talk to you later)\b/i.test(sentence)
       ) {
-          // Wait a moment so the goodbye audio finishes playing
-          setTimeout(() => {
-            endTwilioCall(callSid).catch((err) =>
-              console.error("Error ending Twilio call:", err)
-            );
-          }, 3000);
-        }
-      
+        console.log("Goodbye phrase detected in transcript");
+        goodbyeDetected = true;
+      }
 
-
-
-      
       globalThis._assistantBuffer = "";
     }
   }
+
 
 // ====== CALLER TRANSCRIPT (for logging only) ======
 if (t === "conversation.item.input_audio_transcription.completed" && msg.transcript) {
@@ -345,6 +349,7 @@ if (t === "input_audio_buffer.speech_started") {
   // ====== FORWARD ASSISTANT AUDIO TO TWILIO (gated) ======
   if (isAudio && msg.delta && streamSid && allowAssistantAudio) {
     assistantSpeaking = true; // bot is actively talking
+    lastAudioOutTime = Date.now(); // track last chunk sent to Twilio
   
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(
@@ -356,6 +361,7 @@ if (t === "input_audio_buffer.speech_started") {
       );
     }
   }
+
 });
 
 
@@ -382,6 +388,8 @@ if (t === "input_audio_buffer.speech_started") {
       streamSid = msg.start?.streamSid || null;
       callSid = msg.start?.callSid || null;
 
+      await sendGroupMe("Call connected");
+
       const cp = msg.start?.customParameters || {};
       if (typeof cp.prompt === "string" && cp.prompt.trim()) {
         prompt = cp.prompt.trim();
@@ -391,6 +399,28 @@ if (t === "input_audio_buffer.speech_started") {
       console.log("Start received. prompt:", prompt);
 
       ensureOpenAI();
+
+      // Start watcher that will hang up only after goodbye + audio drain
+      if (!goodbyeCheckTimer) {
+        goodbyeCheckTimer = setInterval(() => {
+          // Need a call, a detected goodbye, and some audio sent
+          if (!callSid || !goodbyeDetected || !lastAudioOutTime) return;
+
+          const msSinceLastAudio = Date.now() - lastAudioOutTime;
+
+          // If it's been quiet for > 1500ms after goodbye, end the call
+          if (msSinceLastAudio > 1500) {
+            console.log("Hanging up after goodbye; audio fully delivered");
+            endTwilioCall(callSid).catch((err) =>
+              console.error("Error ending Twilio call:", err)
+            );
+
+            clearInterval(goodbyeCheckTimer);
+            goodbyeCheckTimer = null;
+          }
+        }, 300); // check ~3x per second
+      }
+
 
       const introTimer = setInterval(() => {
         if (oaiReady && oai && oai.readyState === WebSocket.OPEN) {
@@ -589,6 +619,10 @@ if (t === "input_audio_buffer.speech_started") {
   ws.on("close", () => {
     if (commitTimer) clearTimeout(commitTimer);
     if (bargeInTimeout) clearTimeout(bargeInTimeout);
+    if (goodbyeCheckTimer) {
+      clearInterval(goodbyeCheckTimer);
+      goodbyeCheckTimer = null;
+    }
     if (oai && oai.readyState === WebSocket.OPEN) {
       try {
         oai.close();
@@ -597,6 +631,7 @@ if (t === "input_audio_buffer.speech_started") {
       }
     }
   });
+
 }
 
 // === Helper functions ===
