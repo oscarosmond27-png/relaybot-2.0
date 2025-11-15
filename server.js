@@ -22,9 +22,22 @@ app.post("/groupme", async (req, res) => {
 
     const text = (req.body?.text || "").trim();
     const senderType = req.body?.sender_type || "";
+    
 
     // Ignore messages from the bot itself
     if (senderType === "bot") {
+      return res.send("ok");
+    }
+
+    // Manual kill switch from GroupMe: "end calls"
+    if (/^(end|stop|hang ?up)\s+calls?$/i.test(text)) {
+      try {
+        const endedCount = await endAllInProgressCalls();
+        await sendGroupMe(`Requested Twilio to end ${endedCount} in-progress call(s).`);
+      } catch (err) {
+        console.error("Error ending calls:", err);
+        await sendGroupMe("Failed to end calls due to an error.");
+      }
       return res.send("ok");
     }
 
@@ -667,6 +680,69 @@ async function endTwilioCall(callSid) {
   }
 }
 
+async function endAllInProgressCalls() {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+  if (!accountSid || !authToken) {
+    console.error("Missing Twilio credentials");
+    return 0;
+  }
+
+  const auth = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+
+  // 1) Get all in-progress calls from Twilio
+  const listUrl = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls.json?Status=in-progress`;
+
+  const listRes = await fetch(listUrl, {
+    method: "GET",
+    headers: {
+      Authorization: `Basic ${auth}`,
+    },
+  });
+
+  if (!listRes.ok) {
+    console.error("Failed to fetch in-progress calls:", await listRes.text());
+    return 0;
+  }
+
+  const data = await listRes.json();
+  const calls = data.calls || [];
+
+  if (!calls.length) {
+    console.log("No in-progress calls to end.");
+    return 0;
+  }
+
+  console.log(`Found ${calls.length} in-progress call(s) to end.`);
+
+  // 2) For each call, set Status=completed (hang up)
+  const endPromises = calls.map((call) => {
+    const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Calls/${call.sid}.json`;
+
+    const body = new URLSearchParams({
+      Status: "completed",
+    });
+
+    return fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    }).then(async (res) => {
+      if (!res.ok) {
+        console.error(`Failed to end call ${call.sid}:`, await res.text());
+      } else {
+        console.log(`Ended call ${call.sid}`);
+      }
+    });
+  });
+
+  await Promise.all(endPromises);
+  return calls.length;
+}
 
 
 async function makeTwilioCallWithTwiml(to, promptText) {
