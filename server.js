@@ -409,7 +409,7 @@ if (t === "input_audio_buffer.speech_started") {
           const msSinceLastAudio = Date.now() - lastAudioOutTime;
 
           // If it's been quiet for > 1500ms after goodbye, end the call
-          if (msSinceLastAudio > 1500) {
+          if (msSinceLastAudio > 3500) {
             console.log("Hanging up after goodbye; audio fully delivered");
             endTwilioCall(callSid).catch((err) =>
               console.error("Error ending Twilio call:", err)
